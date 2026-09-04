@@ -109,11 +109,12 @@ $env:MINERU_TOKEN = "你的 MinerU Token"
 
 自动分流规则：
 
-1. 页面具有足够的可见原生文字时，使用本地原生元素解析。
-2. 页面主体是整页扫描图，文字全部或几乎全部属于 PDF `ignore-text` 隐藏层时，整份 PDF 使用 MinerU OCR。
-3. PDF 的原生可见文字总量不足时，整份 PDF 使用 MinerU OCR。
-4. MinerU 使用 `vlm` 模型，并开启 OCR、表格和公式识别；可用 `--mineru-model pipeline` 切换模型。
-5. 超过 API 单文件限制的文档会按 180 页或 190 MiB 的安全阈值自动拆分，最后合并 Markdown 和图片。
+1. `--route auto` 是默认值，单文件和目录批处理都不必额外指定。目录模式会对每个 PDF 分别判断。
+2. 分流颗粒度固定为整份 PDF，只有本地原生解析和 MinerU OCR 两种结果，不会在一份 Markdown 中混合两种引擎。
+3. PDF 具有足够的可见原生文字，并且没有检测到整页扫描页时，整份 PDF 使用本地原生元素解析。
+4. 任意页面检测为整页扫描图、只有 `ignore-text` 隐藏文字层，或整份 PDF 的原生可见文字总量不足时，整份 PDF 使用 MinerU OCR。
+5. MinerU 使用 `vlm` 模型，并开启 OCR、表格和公式识别；可用 `--mineru-model pipeline` 切换模型。
+6. 超过 API 单文件限制的文档会按 180 页或 190 MiB 的安全阈值自动拆分，最后合并 Markdown 和图片。
 
 也可以强制指定路线，便于对同一份大文件分别验证两种处理方式：
 

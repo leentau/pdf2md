@@ -352,6 +352,39 @@ class NativePdfToMarkdownTests(unittest.TestCase):
         self.assertIn("隐藏 OCR", fallback.call_args.kwargs["native_text_rejection"])
         self.assertTrue(report.as_dict()["ocr_used"])
 
+    def test_one_scanned_page_routes_the_complete_pdf_to_mineru(self) -> None:
+        source = self.root / "mixed-native-and-scan.pdf"
+        doc = fitz.open()
+        first = doc.new_page(width=300, height=400)
+        first.insert_text((25, 60), "Visible native text " * 20, fontsize=10)
+        scan = doc.new_page(width=300, height=400)
+        pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 300, 400), False)
+        pix.clear_with(0xE0E0E0)
+        scan.insert_image(scan.rect, stream=pix.tobytes("png"))
+        last = doc.new_page(width=300, height=400)
+        last.insert_text((25, 60), "More visible native text " * 20, fontsize=10)
+        doc.save(source)
+        doc.close()
+
+        expected = DocumentReport(
+            source=str(source),
+            output="whole-document-ocr.md",
+            pages=3,
+            ocr_used=True,
+            conversion_engine="mineru-vlm",
+        )
+        with patch("native_pdf_to_md.convert_pdf_with_mineru", return_value=expected) as fallback:
+            report = convert_pdf(
+                source,
+                self.root / "output",
+                mineru_token="test-token",
+            )
+
+        self.assertIs(report, expected)
+        fallback.assert_called_once()
+        self.assertEqual(fallback.call_args.args[0], source.resolve())
+        self.assertIn("整份 PDF", fallback.call_args.kwargs["native_text_rejection"])
+
     def test_native_pdf_can_be_forced_through_mineru_ocr(self) -> None:
         source = self.make_structured_pdf()
         expected = DocumentReport(

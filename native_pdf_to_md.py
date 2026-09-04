@@ -1523,6 +1523,7 @@ def validate_text_layer(doc: fitz.Document, minimum_chars_per_page: int = 20) ->
     total = 0
     pages_with_text = 0
     hidden_ocr_pages: list[int] = []
+    scanned_image_pages: list[int] = []
     for page in doc:
         extracted_count = len(re.sub(r"\s+", "", page.get_text("text")))
         visible_count, ignored_count = page_text_layer_counts(page)
@@ -1548,6 +1549,12 @@ def validate_text_layer(doc: fitz.Document, minimum_chars_per_page: int = 20) ->
         count = min(extracted_count, visible_count) if visible_count else 0
         if not ignored_count and not visible_count and extracted_count:
             count = extracted_count
+        # Routing remains PDF-granular.  Detecting even one high-confidence
+        # full-page scan therefore routes the complete PDF to MinerU instead
+        # of mixing native and OCR output inside one Markdown document.
+        if image_coverage >= 0.8 and count < minimum_chars_per_page:
+            scanned_image_pages.append(page.number + 1)
+            continue
         total += count
         if count >= minimum_chars_per_page:
             pages_with_text += 1
@@ -1558,6 +1565,13 @@ def validate_text_layer(doc: fitz.Document, minimum_chars_per_page: int = 20) ->
         raise ConversionError(
             "PDF 的以下页面是整页扫描图，并且只有隐藏 OCR 文字层："
             f"{page_list}{suffix}。这些页面需要重新 OCR，不能把隐藏 OCR 结果冒充为原生文字。"
+        )
+    if scanned_image_pages:
+        page_list = ", ".join(str(number) for number in scanned_image_pages[:12])
+        suffix = "……" if len(scanned_image_pages) > 12 else ""
+        raise ConversionError(
+            "PDF 的以下页面检测为整页扫描图："
+            f"{page_list}{suffix}。处理以 PDF 为单位，因此整份 PDF 需要使用 OCR。"
         )
     required = max(1, int(doc.page_count * 0.2))
     if total < 100 or pages_with_text < required:
