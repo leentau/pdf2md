@@ -1,0 +1,10 @@
+#!/usr/bin/env sh
+set -eu
+
+PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ ! -x "$PROJECT_ROOT/.venv/bin/python" ]; then
+    echo "First run: creating the virtual environment and installing dependencies..."
+    "$PROJECT_ROOT/install.sh"
+fi
+
+exec "$PROJECT_ROOT/.venv/bin/python" "$PROJECT_ROOT/native_pdf_to_md.py" "$@"

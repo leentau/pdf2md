@@ -1,0 +1,26 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+_native_pdf_test_*/
+.bootstrap_tmp/
+
+# Local credentials and environment
+.env
+.env.*
+!.env.example
+mineru_token.txt
+*.token
+
+# Runtime output and caches
+.mineru_cache/
+_reports/
+*.log
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
