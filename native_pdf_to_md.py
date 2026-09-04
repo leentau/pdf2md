@@ -19,7 +19,7 @@ import re
 import shutil
 import sys
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
@@ -241,12 +241,67 @@ def block_font_info(block: dict[str, Any]) -> tuple[float, bool, bool, bool, int
     )
 
 
-def is_header_or_footer(rect: fitz.Rect, page_rect: fitz.Rect, page_number: int) -> bool:
+MARGIN_PAGE_NUMBER_RE = re.compile(
+    r"^(?:page\s*)?(?:\d+|[ivxlcdm]+)(?:\s*(?:of|/)\s*\d+)?$",
+    re.IGNORECASE,
+)
+
+
+def margin_text_key(text: str) -> str:
+    return re.sub(r"\s+", " ", clean_text(text)).strip().casefold()
+
+
+def detect_repeated_margin_texts(doc: fitz.Document) -> set[str]:
+    """Find running heads and footers repeated in outer page bands."""
+    counts: Counter[str] = Counter()
+    for page in doc:
+        seen_on_page: set[str] = set()
+        for block in page.get_text("dict", sort=True).get("blocks", []):
+            if block.get("type") != 0 or not block.get("lines"):
+                continue
+            rect = fitz.Rect(block["bbox"])
+            in_margin = (
+                rect.y1 <= page.rect.height * 0.12
+                or rect.y0 >= page.rect.height * 0.88
+            )
+            if not in_margin:
+                continue
+            text = block_text(block)
+            key = margin_text_key(text)
+            if key and len(key) <= 260:
+                seen_on_page.add(key)
+        counts.update(seen_on_page)
+    minimum = 2 if doc.page_count <= 12 else 3
+    return {key for key, count in counts.items() if count >= minimum}
+
+
+def is_header_or_footer(
+    rect: fitz.Rect,
+    page_rect: fitz.Rect,
+    page_number: int,
+    text: str = "",
+    repeated_margin_texts: set[str] | None = None,
+) -> bool:
     # The first page may use the full canvas for the cover.  On regular pages,
-    # headers and footers occupy stable outer bands.
+    # headers and footers occupy stable outer bands.  Wider candidate bands
+    # are used only for text proven to repeat across pages.
     if page_number == 1:
         return rect.y0 >= page_rect.height * 0.94
-    return rect.y1 <= page_rect.height * 0.06 or rect.y0 >= page_rect.height * 0.935
+    top_extreme = rect.y1 <= page_rect.height * 0.075
+    bottom_extreme = rect.y0 >= page_rect.height * 0.89
+    if top_extreme or bottom_extreme:
+        return True
+    top_candidate = rect.y1 <= page_rect.height * 0.12
+    bottom_candidate = rect.y0 >= page_rect.height * 0.88
+    key = margin_text_key(text)
+    if bottom_candidate and MARGIN_PAGE_NUMBER_RE.fullmatch(key):
+        return True
+    return bool(
+        (top_candidate or bottom_candidate)
+        and key
+        and repeated_margin_texts
+        and key in repeated_margin_texts
+    )
 
 
 def detect_heading(
@@ -841,6 +896,41 @@ def detect_tables(page: fitz.Page) -> list[Element]:
     return elements
 
 
+def combine_soft_mask(color: fitz.Pixmap, mask: fitz.Pixmap) -> fitz.Pixmap:
+    """Attach a PDF soft mask, scaling it when encodings use different DPIs."""
+    if color.width != mask.width or color.height != mask.height:
+        mask = fitz.Pixmap(mask, color.width, color.height)
+    if mask.colorspace is not None and mask.colorspace.n != 1:
+        mask = fitz.Pixmap(fitz.csGRAY, mask)
+    return fitz.Pixmap(color, mask)
+
+
+def pixmap_png_bytes(pix: fitz.Pixmap) -> bytes:
+    """Encode any color PDF pixmap through a PNG-compatible color space."""
+    if pix.colorspace is None:
+        raise ValueError("image pixmap has no color space")
+    # Indexed and ICCBased gray-looking pixmaps can report one component but
+    # MuPDF still refuses to encode them as PNG.  DeviceGray and DeviceRGB are
+    # the only native PNG color spaces; normalize every other space to RGB.
+    if pix.colorspace.name not in {"DeviceGray", "DeviceRGB"}:
+        pix = fitz.Pixmap(fitz.csRGB, pix)
+    return pix.tobytes("png")
+
+
+def render_image_region(page: fitz.Page, bbox: Sequence[float]) -> bytes:
+    """Render an image's page rectangle when its embedded stream is malformed."""
+    clip = fitz.Rect(bbox) & page.rect
+    if clip.is_empty or clip.width <= 0 or clip.height <= 0:
+        raise ValueError("image rectangle is outside the page")
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(2, 2),
+        clip=clip,
+        colorspace=fitz.csRGB,
+        alpha=False,
+    )
+    return pix.tobytes("png")
+
+
 def save_image(
     doc: fitz.Document,
     page: fitz.Page,
@@ -853,24 +943,29 @@ def save_image(
     filename = f"page-{page_number:03d}-image-{image_number:02d}.png"
     destination = image_dir / filename
     if xref > 0:
-        pix = fitz.Pixmap(doc, xref)
-        smask = 0
-        for row in page.get_images(full=True):
-            if int(row[0]) == xref:
-                smask = int(row[1])
-                break
-        if smask > 0:
-            mask = fitz.Pixmap(doc, smask)
-            pix = fitz.Pixmap(pix, mask)
-        if pix.colorspace and pix.colorspace.n > 3:
-            pix = fitz.Pixmap(fitz.csRGB, pix)
-        pix.save(destination)
+        try:
+            pix = fitz.Pixmap(doc, xref)
+            smask = 0
+            for row in page.get_images(full=True):
+                if int(row[0]) == xref:
+                    smask = int(row[1])
+                    break
+            if smask > 0 and not pix.alpha:
+                pix = combine_soft_mask(pix, fitz.Pixmap(doc, smask))
+            payload = pixmap_png_bytes(pix)
+        except Exception as exc:
+            LOGGER.debug(
+                "Page %d image xref %d requires rendered fallback: %s",
+                page_number,
+                xref,
+                exc,
+            )
+            payload = render_image_region(page, info["bbox"])
+        destination.write_bytes(payload)
         return destination
 
     # Inline images without an xref are rendered from their exact PDF bounds.
-    clip = fitz.Rect(info["bbox"])
-    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip, alpha=False)
-    pix.save(destination)
+    destination.write_bytes(render_image_region(page, info["bbox"]))
     return destination
 
 
@@ -883,7 +978,17 @@ def image_elements(doc: fitz.Document, page: fitz.Page, image_dir: Path, text_bl
         if rect.width < 24 or rect.height < 24 or rect.get_area() < 1200:
             continue
         number += 1
-        path = save_image(doc, page, info, image_dir, page.number + 1, number)
+        try:
+            path = save_image(doc, page, info, image_dir, page.number + 1, number)
+        except Exception as exc:
+            LOGGER.warning(
+                "第 %d 页图片 %d 无法保存，已跳过：%s",
+                page.number + 1,
+                number,
+                exc,
+            )
+            number -= 1
+            continue
         caption = ""
         preceding: list[tuple[float, str]] = []
         following: list[tuple[float, str]] = []
@@ -1096,7 +1201,12 @@ def sort_elements_reading_order(elements: Sequence[Element], page_rect: fitz.Rec
     return ordered
 
 
-def page_elements(doc: fitz.Document, page: fitz.Page, image_dir: Path) -> tuple[list[Element], list[dict[str, Any]]]:
+def page_elements(
+    doc: fitz.Document,
+    page: fitz.Page,
+    image_dir: Path,
+    repeated_margin_texts: set[str] | None = None,
+) -> tuple[list[Element], list[dict[str, Any]]]:
     raw = page.get_text("dict", sort=True)
     text_blocks: list[dict[str, Any]] = []
     for block in raw.get("blocks", []):
@@ -1117,7 +1227,14 @@ def page_elements(doc: fitz.Document, page: fitz.Page, image_dir: Path) -> tuple
 
     for index, block in enumerate(text_blocks):
         rect = fitz.Rect(block["bbox"])
-        if is_header_or_footer(rect, page.rect, page.number + 1):
+        text = block_text(block)
+        if is_header_or_footer(
+            rect,
+            page.rect,
+            page.number + 1,
+            text,
+            repeated_margin_texts,
+        ):
             continue
         if inside_any(rect, table_rects):
             continue
@@ -1125,7 +1242,6 @@ def page_elements(doc: fitz.Document, page: fitz.Page, image_dir: Path) -> tuple
         # layer.  Keep captions outside the image, drop overlapping duplicates.
         if inside_any(rect, image_rects, threshold=0.75):
             continue
-        text = block_text(block)
         if text:
             elements.append(Element("text", rect, block, index))
 
@@ -1141,8 +1257,9 @@ def render_page(
     report: DocumentReport,
     suppress_heading_fallback: bool = False,
     metadata_title: str = "",
+    repeated_margin_texts: set[str] | None = None,
 ) -> list[str]:
-    elements, _ = page_elements(doc, page, image_dir)
+    elements, _ = page_elements(doc, page, image_dir, repeated_margin_texts)
     two_column_layout = has_two_columns(elements, page.rect)
     output: list[str] = [f"<!-- PDF page {page.number + 1} -->"]
     pending_callout = False
@@ -1795,6 +1912,7 @@ def convert_pdf(
             matched: set[tuple[int, str]] = set()
             markdown: list[str] = []
             metadata_title = clean_text(doc.metadata.get("title", "") if doc.metadata else "")
+            repeated_margin_texts = detect_repeated_margin_texts(doc)
             if metadata_title and not bookmarks:
                 markdown.append(f"# {metadata_title}")
 
@@ -1810,6 +1928,7 @@ def convert_pdf(
                         report,
                         suppress_heading_fallback=(page.number + 1 in suppress_fallback_pages),
                         metadata_title=metadata_title,
+                        repeated_margin_texts=repeated_margin_texts,
                     )
                 )
 
@@ -2002,6 +2121,17 @@ def main(argv: Iterable[str] | None = None) -> int:
                 str(document.relative_to(input_path)) if input_path.is_dir() else document.name
             )
             document_output_root = output_root_for_pdf(input_path, document, output_root)
+            expected_markdown = (
+                document_output_root
+                / safe_name(document.stem)
+                / f"{safe_name(document.stem)}.md"
+            )
+            if input_path.is_dir() and not args.overwrite and expected_markdown.is_file():
+                print(
+                    f"[{index}/{len(documents)}] 跳过 {display_name}"
+                    "（输出已存在）"
+                )
+                continue
             print(f"[{index}/{len(documents)}] 转换 {display_name}")
             if document.suffix.casefold() == ".pdf":
                 report = convert_pdf(

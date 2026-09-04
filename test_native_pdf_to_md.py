@@ -22,6 +22,7 @@ from native_pdf_to_md import (
     convert_pdf,
     dot_leader_block_markdown,
     detect_heading,
+    detect_repeated_margin_texts,
     default_output_root,
     academic_numbered_list_markdown,
     inline_markdown,
@@ -30,10 +31,13 @@ from native_pdf_to_md import (
     join_markdown_parts,
     list_markdown,
     listing_block_markdown,
+    main,
     merge_adjacent_code_parts,
     output_root_for_pdf,
     paragraph_markdown_parts,
     reference_markdown_parts,
+    combine_soft_mask,
+    pixmap_png_bytes,
     sort_elements_reading_order,
 )
 from word_to_md import convert_word_document
@@ -95,6 +99,48 @@ class NativePdfToMarkdownTests(unittest.TestCase):
         doc.close()
         return path
 
+    def test_png_encoding_normalizes_color_and_resizes_soft_mask(self) -> None:
+        color = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 40, 20), False)
+        color.clear_with(0x2A7FD1)
+        mask = fitz.Pixmap(fitz.csGRAY, fitz.IRect(0, 0, 80, 40), False)
+        mask.clear_with(0xB0)
+
+        combined = combine_soft_mask(color, mask)
+        payload = pixmap_png_bytes(combined)
+
+        self.assertEqual((combined.width, combined.height), (40, 20))
+        self.assertTrue(combined.alpha)
+        self.assertEqual(payload[:8], b"\x89PNG\r\n\x1a\n")
+
+    def test_repeated_running_headers_footers_and_page_numbers_are_removed(self) -> None:
+        source = self.root / "running-margins.pdf"
+        doc = fitz.open()
+        for number in range(1, 7):
+            page = doc.new_page(width=612, height=792)
+            if number > 1:
+                page.insert_text((485, 52), "Feedback", fontsize=8)
+                page.insert_text((72, 70), "Chapter 2: Running Header", fontsize=9)
+                page.insert_text((72, 716), "Example Product User Guide W-2024.09", fontsize=8)
+                page.insert_text((530, 716), str(number), fontsize=8)
+            page.insert_text((72, 140), f"Unique body paragraph {number}.", fontsize=11)
+        doc.save(source)
+        doc.close()
+
+        with fitz.open(source) as check_doc:
+            repeated = detect_repeated_margin_texts(check_doc)
+        self.assertIn("feedback", repeated)
+        self.assertIn("chapter 2: running header", repeated)
+
+        convert_pdf(source, self.root / "margin-output", overwrite=True)
+        markdown = (
+            self.root / "margin-output" / "running-margins" / "running-margins.md"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("Feedback", markdown)
+        self.assertNotIn("Chapter 2: Running Header", markdown)
+        self.assertNotIn("Example Product User Guide", markdown)
+        for number in range(1, 7):
+            self.assertIn(f"Unique body paragraph {number}.", markdown)
+
     def test_single_and_directory_inputs_follow_path_mapping_contract(self) -> None:
         source_root = self.root / "source"
         nested = source_root / "section" / "deep"
@@ -136,6 +182,21 @@ class NativePdfToMarkdownTests(unittest.TestCase):
             output_root_for_pdf(source_root, nested_pdf, default_output_root(source_root)),
             self.root / "source_md" / "section" / "deep",
         )
+
+    def test_directory_rerun_skips_completed_documents_without_overwrite(self) -> None:
+        source_root = self.root / "manuals"
+        source_root.mkdir()
+        source = source_root / "done.pdf"
+        source.write_bytes(b"placeholder")
+        completed = self.root / "manuals_md" / "done"
+        completed.mkdir(parents=True)
+        (completed / "done.md").write_text("# Completed\n", encoding="utf-8")
+
+        with patch("native_pdf_to_md.convert_pdf") as converter:
+            exit_code = main([str(source_root), "--route", "native"])
+
+        self.assertEqual(exit_code, 0)
+        converter.assert_not_called()
 
     def test_docx_headings_tables_images_and_adjacent_code_are_preserved(self) -> None:
         from docx import Document
