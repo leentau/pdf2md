@@ -1581,6 +1581,33 @@ def validate_text_layer(doc: fitz.Document, minimum_chars_per_page: int = 20) ->
     return total
 
 
+def read_dotenv_value(path: Path, keys: Sequence[str]) -> str | None:
+    """Read selected values from a dotenv file without changing the process environment."""
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        return None
+    accepted = set(keys)
+    assignment = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+    for raw_line in lines:
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        match = assignment.match(raw_line)
+        if not match or match.group(1) not in accepted:
+            continue
+        value = match.group(2).strip()
+        if value.startswith(('"', "'")):
+            closing_quote = value.find(value[0], 1)
+            if closing_quote > 0:
+                value = value[1:closing_quote]
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
+        value = value.removeprefix("Bearer ").strip()
+        if value:
+            return value
+    return None
+
+
 def find_mineru_token(token_file: Path | None, input_path: Path) -> str | None:
     """Load a MinerU token without putting it in source code or command logs."""
     candidates: list[Path] = []
@@ -1603,6 +1630,28 @@ def find_mineru_token(token_file: Path | None, input_path: Path) -> str | None:
 
     script_dir = Path(__file__).resolve().parent
     input_dir = input_path if input_path.is_dir() else input_path.parent
+
+    # The launchers keep the virtual environment isolated but previously did
+    # not load the project's .env file.  Read it here so Windows batch,
+    # PowerShell, Linux/macOS, single-file and directory runs behave alike.
+    dotenv_candidates = [
+        script_dir / ".env",
+        script_dir.parent / ".env",
+        Path.cwd() / ".env",
+        input_dir / ".env",
+    ]
+    seen_dotenv: set[Path] = set()
+    for dotenv_path in dotenv_candidates:
+        dotenv_path = dotenv_path.expanduser().resolve()
+        if dotenv_path in seen_dotenv:
+            continue
+        seen_dotenv.add(dotenv_path)
+        if not dotenv_path.is_file():
+            continue
+        value = read_dotenv_value(dotenv_path, ("MINERU_TOKEN", "MINERU_API_TOKEN"))
+        if value:
+            return value
+
     candidates.extend(
         [
             script_dir / "mineru_token.txt",
@@ -1883,7 +1932,7 @@ def convert_pdf(
         if not mineru_token:
             reason = native_rejection or "已强制使用 mineru-ocr 路由"
             raise ConversionError(
-                f"{reason}。若要启用 MinerU OCR，请设置 MINERU_TOKEN，"
+                f"{reason.rstrip('。.!！？')}。若要启用 MinerU OCR，请设置 MINERU_TOKEN，"
                 "或使用 --mineru-token-file。"
             )
         return convert_pdf_with_mineru(

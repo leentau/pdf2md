@@ -36,12 +36,13 @@ pdf2md/
 ├─ word_to_md.py             # DOCX 结构预处理与 Pandoc 转换
 ├─ pandoc_word_filter.lua    # 合并相邻 Word 代码段
 ├─ requirements.txt          # 运行依赖
+├─ CHANGELOG.md              # 每次公开更新的修改与验证记录
 ├─ install.ps1 / install.sh  # 创建 .venv 并安装、检查依赖
 ├─ pdf2md.bat / pdf2md       # 自动安装并运行的入口
 └─ test_native_pdf_to_md.py  # 自动化回归测试
 ```
 
-源代码、安装器、启动器和测试都位于同一个目录；不依赖仓库外部的 Python 文件。`.venv`、Token、转换缓存和报告不会上传到 GitHub。
+源代码、安装器、启动器和测试都位于同一个目录；不依赖仓库外部的 Python 文件。每次公开更新都会同时更新 `CHANGELOG.md`，记录修改原因、行为变化、验证结果和兼容性影响。`.venv`、Token、转换缓存和报告不会上传到 GitHub。
 
 ## 输出目录规则
 
@@ -99,6 +100,14 @@ Word 文档转换会保留：
 ```powershell
 $env:MINERU_TOKEN = "你的 MinerU Token"
 ```
+
+也可以复制 `.env.example` 为项目目录下的 `.env`，然后填写 Token：
+
+```dotenv
+MINERU_TOKEN=你的_MinerU_Token
+```
+
+程序会自动读取程序目录、程序上一级、当前目录或输入目录中的 `.env`。系统环境变量的优先级高于 `.env`；`.env` 已由 `.gitignore` 排除，不会上传到 GitHub。
 
 也可以把 Token 单独保存为 `mineru_token.txt`。程序会依次在程序目录、程序目录的上一级和输入 PDF 目录查找；或者显式指定：
 

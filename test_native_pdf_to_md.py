@@ -26,6 +26,7 @@ from native_pdf_to_md import (
     default_output_root,
     academic_numbered_list_markdown,
     inline_markdown,
+    find_mineru_token,
     iter_documents,
     iter_pdfs,
     join_markdown_parts,
@@ -384,6 +385,21 @@ class NativePdfToMarkdownTests(unittest.TestCase):
         fallback.assert_called_once()
         self.assertEqual(fallback.call_args.args[0], source.resolve())
         self.assertIn("整份 PDF", fallback.call_args.kwargs["native_text_rejection"])
+
+    def test_mineru_token_is_loaded_from_input_directory_dotenv(self) -> None:
+        input_dir = self.root / "documents"
+        input_dir.mkdir()
+        (input_dir / ".env").write_text(
+            "# local configuration\nMINERU_TOKEN='dotenv-test-token' # comment\n",
+            encoding="utf-8",
+        )
+        with patch.dict(
+            "os.environ",
+            {"MINERU_TOKEN": "", "MINERU_API_TOKEN": ""},
+            clear=False,
+        ):
+            token = find_mineru_token(None, input_dir)
+        self.assertEqual(token, "dotenv-test-token")
 
     def test_native_pdf_can_be_forced_through_mineru_ocr(self) -> None:
         source = self.make_structured_pdf()
