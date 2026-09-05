@@ -30,6 +30,7 @@ from native_pdf_to_md import (
     iter_documents,
     iter_pdfs,
     join_markdown_parts,
+    locate_mineru_markdown,
     list_markdown,
     listing_block_markdown,
     main,
@@ -400,6 +401,22 @@ class NativePdfToMarkdownTests(unittest.TestCase):
         ):
             token = find_mineru_token(None, input_dir)
         self.assertEqual(token, "dotenv-test-token")
+
+    def test_mineru_markdown_with_original_spaces_is_normalized(self) -> None:
+        output_dir = self.root / "mineru-result"
+        output_dir.mkdir()
+        original = output_dir / "[Paper title] with spaces.md"
+        original.write_text("# Converted\n", encoding="utf-8")
+
+        located = locate_mineru_markdown(
+            output_dir,
+            "[Paper_title]_with_spaces.md",
+            {"markdown": original.name},
+        )
+
+        self.assertEqual(located.name, "[Paper_title]_with_spaces.md")
+        self.assertEqual(located.read_text(encoding="utf-8"), "# Converted\n")
+        self.assertFalse(original.exists())
 
     def test_native_pdf_can_be_forced_through_mineru_ocr(self) -> None:
         source = self.make_structured_pdf()

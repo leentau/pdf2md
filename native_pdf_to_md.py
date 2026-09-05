@@ -1676,6 +1676,46 @@ def find_mineru_token(token_file: Path | None, input_path: Path) -> str | None:
     return None
 
 
+def locate_mineru_markdown(
+    output_dir: Path,
+    expected_name: str,
+    metadata: dict[str, Any] | None = None,
+) -> Path:
+    """Locate MinerU's merged Markdown and normalize it to the final name."""
+    expected = output_dir / expected_name
+    if expected.is_file():
+        return expected
+
+    candidates: list[Path] = []
+    metadata_name = str((metadata or {}).get("markdown", "")).strip()
+    if metadata_name:
+        metadata_path = output_dir / Path(metadata_name).name
+        if metadata_path.is_file():
+            candidates.append(metadata_path)
+    candidates.extend(path for path in output_dir.glob("*.md") if path.is_file())
+
+    unique_candidates: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_candidates.append(candidate)
+    if not unique_candidates:
+        raise ConversionError(
+            f"MinerU OCR 已完成，但结果目录中没有 Markdown 文件：{output_dir}"
+        )
+    if len(unique_candidates) > 1:
+        names = ", ".join(path.name for path in unique_candidates[:6])
+        raise ConversionError(
+            f"MinerU OCR 结果中存在多个 Markdown 文件，无法确定主文件：{names}"
+        )
+
+    unique_candidates[0].replace(expected)
+    return expected
+
+
 def convert_pdf_with_mineru(
     source: Path,
     output_root: Path,
@@ -1760,9 +1800,11 @@ def convert_pdf_with_mineru(
         shutil.rmtree(temp_output / ".mineru_work", ignore_errors=True)
         shutil.rmtree(temp_output / ".mineru_extract", ignore_errors=True)
 
-        markdown_path = temp_output / f"{folder_name}.md"
-        if not markdown_path.is_file():
-            raise ConversionError("MinerU OCR 已完成，但结果中没有生成 Markdown 文件。")
+        markdown_path = locate_mineru_markdown(
+            temp_output,
+            f"{folder_name}.md",
+            mineru_meta,
+        )
         markdown_text = markdown_path.read_text(encoding="utf-8", errors="replace")
         with fitz.open(source) as doc:
             page_count = doc.page_count
