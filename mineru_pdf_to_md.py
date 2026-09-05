@@ -248,8 +248,8 @@ class MineruApi:
         is_ocr: bool = False,
         retry_times: int = 5,
         retry_base_seconds: float = 2.0,
-        upload_timeout: float = 3600.0,
-        download_timeout: float = 3600.0,
+        upload_timeout: float = 180.0,
+        download_timeout: float = 180.0,
         session: requests.Session | None = None,
     ) -> None:
         self.token = token
@@ -468,6 +468,22 @@ class MineruApi:
 
     def download_zip(self, url: str, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_file() and zipfile.is_zipfile(destination):
+            return
+        partial = destination.with_suffix(destination.suffix + ".part")
+        if destination.is_file():
+            try:
+                # Keep the legacy file in place until the resumed download is
+                # verified. Copying is more reliable than os.replace on
+                # Windows and survives a crash during cache migration.
+                if not partial.exists() or destination.stat().st_size > partial.stat().st_size:
+                    shutil.copyfile(destination, partial)
+            except PermissionError as exc:
+                raise MineruApiError(
+                    "MinerU 下载缓存正被另一个 pdf2md 进程占用；"
+                    "请先在原终端按 Ctrl+C，等待进程退出后再运行。",
+                    retryable=False,
+                ) from exc
         last_error: Exception | None = None
         parsed = urllib.parse.urlsplit(url)
         hostname = parsed.hostname or ""
@@ -482,20 +498,29 @@ class MineruApi:
             if any(is_rfc2544_fake_ip(value) for value in local_addresses):
                 LOGGER.warning("检测到 MinerU CDN 被解析为 198.18.x.x fake-IP，改用保留 TLS 校验的直连下载")
                 try:
-                    self._download_zip_via_public_ip(url, destination)
+                    self._download_zip_via_public_ip(url, destination, partial)
                     return
                 except Exception as exc:
                     last_error = exc
                     LOGGER.warning("CDN fake-IP 直连回退失败，将尝试系统网络: %s", redact(exc, self.token))
         for attempt in range(1, self.retry_times + 1):
+            write_target = partial
             try:
+                offset = partial.stat().st_size if partial.is_file() else 0
+                headers = {"Accept": "application/zip, application/octet-stream, */*"}
+                if offset:
+                    headers["Range"] = f"bytes={offset}-"
+                    LOGGER.warning("继续下载 MinerU 结果：已保留 %.1f MiB", offset / 1024**2)
                 # The URL is already signed; do not send the API token to the CDN.
                 with self.session.get(
                     url,
-                    headers={"Accept": "application/zip, application/octet-stream, */*"},
+                    headers=headers,
                     stream=True,
                     timeout=(30.0, self.download_timeout),
                 ) as response:
+                    if response.status_code == 416 and partial.is_file() and zipfile.is_zipfile(partial):
+                        partial.replace(destination)
+                        return
                     if response.status_code >= 400:
                         retryable = is_retryable_http_status(response.status_code)
                         error = MineruApiError(
@@ -507,16 +532,37 @@ class MineruApi:
                             self._backoff(attempt)
                             continue
                         raise error
-                    with destination.open("wb") as handle:
+                    append, expected_total = self._download_response_plan(
+                        response.status_code,
+                        response.headers,
+                        offset,
+                    )
+                    mode = "ab" if append else "wb"
+                    downloaded = offset if append else 0
+                    if offset and not append:
+                        write_target = partial.with_suffix(partial.suffix + ".restart")
+                        LOGGER.warning(
+                            "当前 CDN 不支持断点续传，改用独立临时文件从头下载；"
+                            "已保留原有 %.1f MiB",
+                            offset / 1024**2,
+                        )
+                    next_progress = downloaded + 8 * 1024**2
+                    with write_target.open(mode) as handle:
                         for block in response.iter_content(chunk_size=1024 * 1024):
                             if block:
                                 handle.write(block)
-                if destination.stat().st_size == 0:
-                    raise MineruApiError("结果 ZIP 为空", retryable=True)
+                                downloaded += len(block)
+                                if downloaded >= next_progress:
+                                    self._log_download_progress(downloaded, expected_total)
+                                    next_progress = downloaded + 8 * 1024**2
+                self._finish_zip_download(write_target, destination, expected_total)
+                if write_target != partial:
+                    partial.unlink(missing_ok=True)
                 return
             except MineruApiError:
                 raise
             except (requests.RequestException, OSError) as exc:
+                self._keep_longest_partial(partial)
                 last_error = exc
                 if attempt < self.retry_times:
                     LOGGER.warning("结果 ZIP 下载网络异常: %s", redact(exc, self.token))
@@ -530,7 +576,7 @@ class MineruApi:
         # Resolve the current public address through DoH, connect to that IP,
         # and still use the original hostname for SNI and certificate checks.
         try:
-            self._download_zip_via_public_ip(url, destination)
+            self._download_zip_via_public_ip(url, destination, partial)
             return
         except Exception as direct_error:
             raise MineruApiError(
@@ -540,7 +586,83 @@ class MineruApi:
                 retryable=True,
             ) from direct_error
 
-    def _download_zip_via_public_ip(self, url: str, destination: Path) -> None:
+    @staticmethod
+    def _download_response_plan(
+        status: int,
+        headers: Mapping[str, str],
+        offset: int,
+    ) -> tuple[bool, int | None]:
+        """Return append mode and expected total size for a ranged response."""
+        if offset and status == 206:
+            content_range = str(headers.get("Content-Range", ""))
+            match = re.match(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", content_range, re.IGNORECASE)
+            if not match or int(match.group(1)) != offset:
+                raise OSError(f"CDN 返回了无效的续传范围：{content_range or 'missing'}")
+            total = None if match.group(3) == "*" else int(match.group(3))
+            return True, total
+        content_length = str(headers.get("Content-Length", "")).strip()
+        total = int(content_length) if content_length.isdigit() else None
+        return False, total
+
+    @staticmethod
+    def _log_download_progress(downloaded: int, expected_total: int | None) -> None:
+        if expected_total:
+            percent = min(100.0, downloaded * 100.0 / expected_total)
+            LOGGER.warning(
+                "MinerU 结果下载进度：%.1f/%.1f MiB（%.0f%%）",
+                downloaded / 1024**2,
+                expected_total / 1024**2,
+                percent,
+            )
+        else:
+            LOGGER.warning("MinerU 结果下载进度：%.1f MiB", downloaded / 1024**2)
+
+    @staticmethod
+    def _finish_zip_download(
+        partial: Path,
+        destination: Path,
+        expected_total: int | None,
+    ) -> None:
+        size = partial.stat().st_size if partial.is_file() else 0
+        if not size:
+            raise OSError("结果 ZIP 为空")
+        if expected_total is not None and size != expected_total:
+            raise OSError(
+                f"结果 ZIP 下载不完整：已下载 {size} 字节，应为 {expected_total} 字节"
+            )
+        if not zipfile.is_zipfile(partial):
+            raise OSError("结果 ZIP 不完整或格式无效")
+        try:
+            partial.replace(destination)
+        except PermissionError as exc:
+            raise MineruApiError(
+                "MinerU 下载缓存正被另一个 pdf2md 进程占用；"
+                "请先在原终端按 Ctrl+C，等待进程退出后再运行。",
+                retryable=False,
+            ) from exc
+
+    @staticmethod
+    def _keep_longest_partial(partial: Path) -> None:
+        """Keep the longest valid byte prefix after a non-range restart fails."""
+        restart = partial.with_suffix(partial.suffix + ".restart")
+        if not restart.is_file():
+            return
+        try:
+            if not partial.is_file() or restart.stat().st_size > partial.stat().st_size:
+                restart.replace(partial)
+            else:
+                restart.unlink()
+        except PermissionError:
+            # A concurrent process will be reported by the next cache access;
+            # do not discard either file here.
+            return
+
+    def _download_zip_via_public_ip(
+        self,
+        url: str,
+        destination: Path,
+        partial: Path | None = None,
+    ) -> None:
         parsed = urllib.parse.urlsplit(url)
         hostname = parsed.hostname or ""
         if parsed.scheme != "https" or hostname != "cdn-mineru.openxlab.org.cn":
@@ -570,8 +692,7 @@ class MineruApi:
 
         request_target = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         errors: list[str] = []
-        partial = destination.with_suffix(destination.suffix + ".part")
-        partial.unlink(missing_ok=True)
+        partial = partial or destination.with_suffix(destination.suffix + ".part")
         for address in addresses:
             pool = urllib3.HTTPSConnectionPool(
                 address,
@@ -582,29 +703,58 @@ class MineruApi:
                 retries=False,
             )
             response = None
+            write_target = partial
             try:
+                offset = partial.stat().st_size if partial.is_file() else 0
+                headers = {"Host": hostname, "Accept": "application/zip, application/octet-stream, */*"}
+                if offset:
+                    headers["Range"] = f"bytes={offset}-"
+                    LOGGER.warning("继续下载 MinerU 结果：已保留 %.1f MiB", offset / 1024**2)
                 response = pool.request(
                     "GET",
                     request_target,
-                    headers={"Host": hostname, "Accept": "application/zip, application/octet-stream, */*"},
+                    headers=headers,
                     preload_content=False,
                     redirect=False,
                 )
+                if response.status == 416 and partial.is_file() and zipfile.is_zipfile(partial):
+                    partial.replace(destination)
+                    LOGGER.info("MinerU CDN fake-IP 回退成功（TLS 域名校验保持开启）")
+                    return
                 if response.status < 200 or response.status >= 300:
                     raise MineruApiError(f"CDN 直连 HTTP {response.status}")
-                with partial.open("wb") as handle:
+                append, expected_total = self._download_response_plan(
+                    response.status,
+                    response.headers,
+                    offset,
+                )
+                mode = "ab" if append else "wb"
+                downloaded = offset if append else 0
+                if offset and not append:
+                    write_target = partial.with_suffix(partial.suffix + ".restart")
+                    LOGGER.warning(
+                        "当前 CDN 地址不支持断点续传，改用独立临时文件从头下载；"
+                        "已保留原有 %.1f MiB",
+                        offset / 1024**2,
+                    )
+                next_progress = downloaded + 8 * 1024**2
+                with write_target.open(mode) as handle:
                     while True:
                         block = response.read(1024 * 1024)
                         if not block:
                             break
                         handle.write(block)
-                if partial.stat().st_size == 0:
-                    raise MineruApiError("CDN 直连结果 ZIP 为空")
-                partial.replace(destination)
+                        downloaded += len(block)
+                        if downloaded >= next_progress:
+                            self._log_download_progress(downloaded, expected_total)
+                            next_progress = downloaded + 8 * 1024**2
+                self._finish_zip_download(write_target, destination, expected_total)
+                if write_target != partial:
+                    partial.unlink(missing_ok=True)
                 LOGGER.info("MinerU CDN fake-IP 回退成功（TLS 域名校验保持开启）")
                 return
             except Exception as exc:
-                partial.unlink(missing_ok=True)
+                self._keep_longest_partial(partial)
                 errors.append(f"{address}: {redact(exc, self.token, limit=300)}")
             finally:
                 if response is not None:
@@ -1002,6 +1152,11 @@ class PdfProcessor:
         else:
             LOGGER.info("发现未完成状态，继续处理: %s", item.source)
 
+        state["status"] = "processing"
+        state.pop("error", None)
+        state.pop("traceback", None)
+        atomic_write_json(state_path, state)
+
         archives: list[Path] = []
         try:
             for chunk in state.get("chunks", []):
@@ -1078,8 +1233,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-times", type=int, default=5, help="单次 HTTP 操作最大尝试次数")
     parser.add_argument("--task-retries", type=int, default=3, help="解析分片失败时重新提交的次数")
     parser.add_argument("--retry-base-seconds", type=float, default=2.0, help="指数退避初始秒数")
-    parser.add_argument("--upload-timeout", type=float, default=3600.0, help="单次文件上传读超时（秒）")
-    parser.add_argument("--download-timeout", type=float, default=3600.0, help="结果下载读超时（秒）")
+    parser.add_argument(
+        "--upload-timeout",
+        type=float,
+        default=180.0,
+        help="文件上传连续无响应的超时秒数",
+    )
+    parser.add_argument(
+        "--download-timeout",
+        type=float,
+        default=180.0,
+        help="结果下载连续无数据的超时秒数；收到数据后重新计时",
+    )
     parser.add_argument("--limit", type=int, help="只处理前 N 个 PDF，适合先试跑")
     parser.add_argument("--overwrite", action="store_true", help="重新转换已有输出")
     parser.add_argument("--dry-run", action="store_true", help="只扫描并显示映射，不调用 API")

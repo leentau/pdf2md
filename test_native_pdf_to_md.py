@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import shutil
 import unittest
 import uuid
@@ -44,6 +45,7 @@ from native_pdf_to_md import (
 )
 from word_to_md import convert_word_document
 from mineru_pdf_to_md import (
+    MineruApi,
     is_rfc2544_fake_ip,
     merge_result_archives,
     public_ipv4_answers,
@@ -417,6 +419,89 @@ class NativePdfToMarkdownTests(unittest.TestCase):
         self.assertEqual(located.name, "[Paper_title]_with_spaces.md")
         self.assertEqual(located.read_text(encoding="utf-8"), "# Converted\n")
         self.assertFalse(original.exists())
+
+    def test_mineru_zip_download_resumes_legacy_partial_file(self) -> None:
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, "w") as archive:
+            archive.writestr("result/full.md", "# Resumed\n")
+        payload = archive_bytes.getvalue()
+        split_at = len(payload) // 2
+
+        destination = self.root / "result.zip"
+        destination.write_bytes(payload[:split_at])
+        destination.with_suffix(".zip.part").write_bytes(b"")
+
+        class FakeResponse:
+            status_code = 206
+            headers = {
+                "Content-Range": f"bytes {split_at}-{len(payload) - 1}/{len(payload)}",
+                "Content-Length": str(len(payload) - split_at),
+            }
+            text = ""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def iter_content(self, chunk_size: int):
+                del chunk_size
+                yield payload[split_at:]
+
+        class FakeSession:
+            def __init__(self):
+                self.headers = None
+
+            def get(self, _url, *, headers, stream, timeout):
+                del stream, timeout
+                self.headers = headers
+                return FakeResponse()
+
+        session = FakeSession()
+        api = MineruApi("test-token", session=session, retry_times=1)
+        api.download_zip("https://example.com/result.zip", destination)
+
+        self.assertEqual(destination.read_bytes(), payload)
+        self.assertEqual(session.headers["Range"], f"bytes={split_at}-")
+        self.assertFalse(destination.with_suffix(".zip.part").exists())
+
+    def test_mineru_non_range_restart_never_shrinks_saved_progress(self) -> None:
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, "w") as archive:
+            archive.writestr("result/full.md", "# Keep progress\n" * 100)
+        payload = archive_bytes.getvalue()
+        saved_size = len(payload) * 3 // 5
+        destination = self.root / "interrupted.zip"
+        destination.write_bytes(payload[:saved_size])
+
+        class IncompleteFullResponse:
+            status_code = 200
+            headers = {"Content-Length": str(len(payload))}
+            text = ""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def iter_content(self, chunk_size: int):
+                del chunk_size
+                yield payload[: len(payload) // 3]
+
+        class NonRangeSession:
+            def get(self, _url, *, headers, stream, timeout):
+                del headers, stream, timeout
+                return IncompleteFullResponse()
+
+        api = MineruApi("test-token", session=NonRangeSession(), retry_times=1)
+        with self.assertRaisesRegex(Exception, "下载失败"):
+            api.download_zip("https://example.com/result.zip", destination)
+
+        partial = destination.with_suffix(".zip.part")
+        self.assertGreaterEqual(partial.stat().st_size, saved_size)
+        self.assertFalse(destination.with_suffix(".zip.part.restart").exists())
 
     def test_native_pdf_can_be_forced_through_mineru_ocr(self) -> None:
         source = self.make_structured_pdf()
