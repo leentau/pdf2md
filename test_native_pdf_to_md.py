@@ -37,6 +37,8 @@ from native_pdf_to_md import (
     main,
     merge_adjacent_code_parts,
     output_root_for_pdf,
+    page_drawing_content_stream_bytes,
+    page_elements,
     paragraph_markdown_parts,
     reference_markdown_parts,
     combine_soft_mask,
@@ -115,6 +117,30 @@ class NativePdfToMarkdownTests(unittest.TestCase):
         self.assertEqual((combined.width, combined.height), (40, 20))
         self.assertTrue(combined.alpha)
         self.assertEqual(payload[:8], b"\x89PNG\r\n\x1a\n")
+
+    def test_complex_vector_page_skips_only_drawing_analysis(self) -> None:
+        doc = fitz.open()
+        doc.new_page().insert_text((60, 100), "First page")
+        page = doc.new_page()
+        page.insert_text((60, 100), "Native body text remains available.")
+        image_dir = self.root / "guard-images"
+        image_dir.mkdir()
+
+        self.assertGreater(page_drawing_content_stream_bytes(page), 0)
+        with (
+            patch(
+                "native_pdf_to_md.page_drawing_content_stream_bytes",
+                return_value=3 * 1024 * 1024,
+            ),
+            patch("native_pdf_to_md.vector_figure_elements") as vector_figures,
+            patch("native_pdf_to_md.detect_tables") as tables,
+        ):
+            elements, _ = page_elements(doc, page, image_dir)
+
+        vector_figures.assert_not_called()
+        tables.assert_not_called()
+        self.assertTrue(any(element.kind == "text" for element in elements))
+        doc.close()
 
     def test_repeated_running_headers_footers_and_page_numbers_are_removed(self) -> None:
         source = self.root / "running-margins.pdf"

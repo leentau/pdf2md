@@ -35,6 +35,14 @@ except ImportError:  # PyMuPDF < 1.24
 
 LOGGER = logging.getLogger("native_pdf_to_md")
 
+# PyMuPDF expands every path in a page before ``get_drawings()`` and
+# ``find_tables()`` return.  Plot-heavy papers can contain hundreds of
+# thousands of tiny paths in one compressed content stream, which makes those
+# calls appear to hang for minutes.  Embedded images and text do not need that
+# expansion, so pages above this conservative threshold skip only vector
+# figure and vector-table discovery.
+MAX_DRAWING_CONTENT_STREAM_BYTES = 2 * 1024 * 1024
+
 HEADING_SIZES = ((22.0, 1), (15.0, 2), (12.2, 3))
 CALLOUT_LABELS = {"note", "tip", "warning", "caution", "important", "example"}
 BULLETS = {"•": "-", "●": "-", "▪": "-", "·": "-", "–": "-", "◦": "  -", "○": "  -"}
@@ -1201,6 +1209,26 @@ def sort_elements_reading_order(elements: Sequence[Element], page_rect: fitz.Rec
     return ordered
 
 
+def page_drawing_content_stream_bytes(page: fitz.Page) -> int:
+    """Return compressed page-content bytes used as a cheap path-complexity guard."""
+    document = page.parent
+    if document is None:
+        return 0
+    total = 0
+    try:
+        content_xrefs = page.get_contents()
+    except (AttributeError, RuntimeError, ValueError):
+        return 0
+    for xref in content_xrefs:
+        try:
+            payload = document.xref_stream_raw(int(xref))
+        except (RuntimeError, TypeError, ValueError):
+            continue
+        if payload:
+            total += len(payload)
+    return total
+
+
 def page_elements(
     doc: fitz.Document,
     page: fitz.Page,
@@ -1215,12 +1243,23 @@ def page_elements(
         text_blocks.extend(split_leading_academic_heading(block))
     images = image_elements(doc, page, image_dir, text_blocks)
     raster_rects = [element.bbox for element in images]
-    vector_figures = vector_figure_elements(page, image_dir, text_blocks, raster_rects)
+    drawing_stream_bytes = page_drawing_content_stream_bytes(page)
+    skip_drawing_analysis = drawing_stream_bytes > MAX_DRAWING_CONTENT_STREAM_BYTES
+    if skip_drawing_analysis:
+        LOGGER.warning(
+            "第 %d 页的矢量绘图内容过大（%.1f MiB），已跳过矢量插图和矢量表格分析；"
+            "正文与嵌入图片仍会正常提取。",
+            page.number + 1,
+            drawing_stream_bytes / (1024 * 1024),
+        )
+        vector_figures = []
+    else:
+        vector_figures = vector_figure_elements(page, image_dir, text_blocks, raster_rects)
     images.extend(vector_figures)
     image_rects = [element.bbox for element in images]
     # Decorative cover lines can look like a large empty table.  Figures with
     # chart grids can too, so discard table candidates inside detected figures.
-    tables = [] if page.number == 0 else detect_tables(page)
+    tables = [] if page.number == 0 or skip_drawing_analysis else detect_tables(page)
     tables = [element for element in tables if not inside_any(element.bbox, image_rects, threshold=0.35)]
     table_rects = [element.bbox for element in tables]
     elements: list[Element] = [*tables, *images]
