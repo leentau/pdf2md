@@ -48,6 +48,7 @@ from native_pdf_to_md import (
 from word_to_md import convert_word_document
 from mineru_pdf_to_md import (
     MineruApi,
+    MineruApiError,
     is_rfc2544_fake_ip,
     merge_result_archives,
     public_ipv4_answers,
@@ -415,6 +416,39 @@ class NativePdfToMarkdownTests(unittest.TestCase):
         self.assertEqual(fallback.call_args.args[0], source.resolve())
         self.assertIn("整份 PDF", fallback.call_args.kwargs["native_text_rejection"])
 
+    def test_complex_vector_page_routes_the_complete_pdf_to_mineru(self) -> None:
+        source = self.root / "vector-heavy.pdf"
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((60, 100), "Visible native text " * 20, fontsize=10)
+        doc.save(source)
+        doc.close()
+
+        expected = DocumentReport(
+            source=str(source),
+            output="vector-heavy-ocr.md",
+            pages=1,
+            ocr_used=True,
+            conversion_engine="mineru-vlm",
+        )
+        with (
+            patch(
+                "native_pdf_to_md.page_drawing_content_stream_bytes",
+                return_value=3 * 1024 * 1024,
+            ),
+            patch("native_pdf_to_md.convert_pdf_with_mineru", return_value=expected) as fallback,
+        ):
+            report = convert_pdf(
+                source,
+                self.root / "output",
+                mineru_token="test-token",
+            )
+
+        self.assertIs(report, expected)
+        fallback.assert_called_once()
+        self.assertIn("超复杂矢量", fallback.call_args.kwargs["native_text_rejection"])
+        self.assertIn("整份 PDF", fallback.call_args.kwargs["native_text_rejection"])
+
     def test_mineru_token_is_loaded_from_input_directory_dotenv(self) -> None:
         input_dir = self.root / "documents"
         input_dir.mkdir()
@@ -491,6 +525,26 @@ class NativePdfToMarkdownTests(unittest.TestCase):
         self.assertEqual(destination.read_bytes(), payload)
         self.assertEqual(session.headers["Range"], f"bytes={split_at}-")
         self.assertFalse(destination.with_suffix(".zip.part").exists())
+
+    def test_mineru_upload_uses_one_put_per_task_retry(self) -> None:
+        source = self.root / "upload.pdf"
+        source.write_bytes(b"pdf payload")
+
+        class FailingUploadSession:
+            def __init__(self):
+                self.calls = 0
+
+            def put(self, _url, *, data, timeout):
+                del data, timeout
+                self.calls += 1
+                raise OSError("simulated upload failure")
+
+        session = FailingUploadSession()
+        api = MineruApi("test-token", session=session, retry_times=5)
+        with self.assertRaisesRegex(MineruApiError, "文件上传网络异常"):
+            api.upload_file(source, "https://example.com/upload")
+
+        self.assertEqual(session.calls, 1)
 
     def test_mineru_non_range_restart_never_shrinks_saved_progress(self) -> None:
         archive_bytes = io.BytesIO()

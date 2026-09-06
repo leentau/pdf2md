@@ -1563,10 +1563,14 @@ def validate_text_layer(doc: fitz.Document, minimum_chars_per_page: int = 20) ->
     pages_with_text = 0
     hidden_ocr_pages: list[int] = []
     scanned_image_pages: list[int] = []
+    complex_vector_pages: list[tuple[int, int]] = []
     for page in doc:
         extracted_count = len(re.sub(r"\s+", "", page.get_text("text")))
         visible_count, ignored_count = page_text_layer_counts(page)
         image_coverage = page_image_coverage(page)
+        drawing_stream_bytes = page_drawing_content_stream_bytes(page)
+        if drawing_stream_bytes > MAX_DRAWING_CONTENT_STREAM_BYTES:
+            complex_vector_pages.append((page.number + 1, drawing_stream_bytes))
 
         # A full-page raster image with nearly all text set to PDF rendering
         # mode 3 (invisible / ignore-text) is a scanned page carrying a hidden
@@ -1611,6 +1615,16 @@ def validate_text_layer(doc: fitz.Document, minimum_chars_per_page: int = 20) ->
         raise ConversionError(
             "PDF 的以下页面检测为整页扫描图："
             f"{page_list}{suffix}。处理以 PDF 为单位，因此整份 PDF 需要使用 OCR。"
+        )
+    if complex_vector_pages:
+        details = ", ".join(
+            f"{number}（{size / (1024 * 1024):.1f} MiB）"
+            for number, size in complex_vector_pages[:12]
+        )
+        suffix = "……" if len(complex_vector_pages) > 12 else ""
+        raise ConversionError(
+            "PDF 的以下页面包含超复杂矢量绘图内容："
+            f"{details}{suffix}。为避免本地矢量分析长时间卡住，整份 PDF 需要使用 MinerU OCR。"
         )
     required = max(1, int(doc.page_count * 0.2))
     if total < 100 or pages_with_text < required:

@@ -76,6 +76,48 @@ class LocalPdfError(MineruError):
     pass
 
 
+class UploadProgressReader:
+    """File wrapper that reports streamed PUT progress without buffering the PDF."""
+
+    def __init__(self, handle: Any, *, total: int, label: str) -> None:
+        self.handle = handle
+        self.total = max(0, total)
+        self.label = label
+        self.sent = 0
+        self.next_progress = 8 * 1024**2
+
+    def __len__(self) -> int:
+        return self.total
+
+    def read(self, size: int = -1) -> bytes:
+        payload = self.handle.read(size)
+        if payload:
+            self.sent += len(payload)
+            if self.sent >= self.next_progress or self.sent >= self.total:
+                percent = self.sent * 100 / self.total if self.total else 0
+                LOGGER.warning(
+                    "MinerU 文件上传进度 %s：%.1f/%.1f MiB（%.0f%%）",
+                    self.label,
+                    self.sent / 1024**2,
+                    self.total / 1024**2,
+                    percent,
+                )
+                self.next_progress = self.sent + 8 * 1024**2
+        return payload
+
+    def tell(self) -> int:
+        return self.handle.tell()
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        position = self.handle.seek(offset, whence)
+        self.sent = max(0, int(position))
+        self.next_progress = self.sent + 8 * 1024**2
+        return position
+
+    def fileno(self) -> int:
+        return self.handle.fileno()
+
+
 @dataclass(frozen=True)
 class PdfItem:
     source: Path
@@ -374,44 +416,44 @@ class MineruApi:
         return str(batch_id), str(urls[0])
 
     def upload_file(self, file_path: Path, upload_url: str) -> None:
-        last_error: Exception | None = None
-        for attempt in range(1, self.retry_times + 1):
-            try:
-                with file_path.open("rb") as handle:
-                    response = self.session.put(
-                        upload_url,
-                        data=handle,
-                        # MinerU explicitly says not to set Content-Type for this PUT.
-                        timeout=(30.0, self.upload_timeout),
-                    )
-                if response.status_code in {200, 201, 204}:
-                    return
-                # A signed OSS URL can return 401/403 when it expires.  The
-                # caller will request a fresh signed URL on the next task
-                # retry instead of treating this as a permanent parse error.
-                retryable = is_retryable_http_status(response.status_code) or response.status_code in {401, 403}
-                error = MineruApiError(
-                    f"文件上传失败 HTTP {response.status_code}: {redact(response.text, self.token)}",
-                    retryable=retryable,
-                    http_status=response.status_code,
+        # Do one PUT for each signed upload task. PdfProcessor owns task-level
+        # retries and requests a fresh signed URL after a failure. Retrying the
+        # same PUT here hid progress for up to retry_times * upload_timeout and
+        # could keep state.json at "uploading" for many minutes.
+        try:
+            total = file_path.stat().st_size
+            LOGGER.warning(
+                "开始上传 MinerU 文件 %s：%.1f MiB（无响应超时 %.0f 秒）",
+                file_path.name,
+                total / 1024**2,
+                self.upload_timeout,
+            )
+            with file_path.open("rb") as handle:
+                reader = UploadProgressReader(handle, total=total, label=file_path.name)
+                response = self.session.put(
+                    upload_url,
+                    data=reader,
+                    # MinerU explicitly says not to set Content-Type for this PUT.
+                    timeout=(30.0, self.upload_timeout),
                 )
-                if retryable and attempt < self.retry_times:
-                    self._backoff(attempt)
-                    continue
-                raise error
-            except MineruApiError:
-                raise
-            except (requests.RequestException, OSError) as exc:
-                last_error = exc
-                if attempt < self.retry_times:
-                    LOGGER.warning("文件上传网络异常: %s", redact(exc, self.token))
-                    self._backoff(attempt)
-                    continue
-                raise MineruApiError(
-                    f"文件上传失败（已重试 {self.retry_times} 次）: {redact(exc, self.token)}",
-                    retryable=True,
-                ) from exc
-        raise MineruApiError(f"文件上传失败: {redact(last_error, self.token)}", retryable=True)
+            if response.status_code in {200, 201, 204}:
+                LOGGER.warning("MinerU 文件上传完成：%s", file_path.name)
+                return
+            # A signed OSS URL can return 401/403 when it expires. The caller
+            # requests a fresh signed URL on the next task-level retry.
+            retryable = is_retryable_http_status(response.status_code) or response.status_code in {401, 403}
+            raise MineruApiError(
+                f"文件上传失败 HTTP {response.status_code}: {redact(response.text, self.token)}",
+                retryable=retryable,
+                http_status=response.status_code,
+            )
+        except MineruApiError:
+            raise
+        except (requests.RequestException, OSError) as exc:
+            raise MineruApiError(
+                f"文件上传网络异常: {redact(exc, self.token)}",
+                retryable=True,
+            ) from exc
 
     def get_batch_result(self, batch_id: str) -> dict[str, Any]:
         result = self._request_json(
