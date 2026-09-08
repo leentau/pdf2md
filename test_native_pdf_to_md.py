@@ -20,6 +20,7 @@ from native_pdf_to_md import (
     Element,
     Bookmark,
     code_markdown,
+    command_reference_table_markdown,
     convert_pdf,
     dot_leader_block_markdown,
     detect_heading,
@@ -27,6 +28,7 @@ from native_pdf_to_md import (
     default_output_root,
     academic_numbered_list_markdown,
     inline_markdown,
+    is_header_or_footer,
     find_mineru_token,
     iter_documents,
     iter_pdfs,
@@ -44,6 +46,7 @@ from native_pdf_to_md import (
     combine_soft_mask,
     pixmap_png_bytes,
     sort_elements_reading_order,
+    split_structured_text_block,
 )
 from word_to_md import convert_word_document
 from mineru_pdf_to_md import (
@@ -142,6 +145,26 @@ class NativePdfToMarkdownTests(unittest.TestCase):
         tables.assert_not_called()
         self.assertTrue(any(element.kind == "text" for element in elements))
         doc.close()
+
+    def test_drawing_complexity_includes_nested_form_xobjects(self) -> None:
+        form_source = fitz.open()
+        form_page = form_source.new_page(width=200, height=200)
+        for offset in range(20):
+            form_page.draw_line((10, 10 + offset), (190, 190 - offset))
+
+        target = fitz.open()
+        target_page = target.new_page(width=300, height=300)
+        target_page.show_pdf_page(fitz.Rect(20, 20, 280, 280), form_source, 0)
+        direct_size = sum(
+            len(target.xref_stream_raw(xref) or b"")
+            for xref in target_page.get_contents()
+        )
+        guarded_size = page_drawing_content_stream_bytes(target_page)
+
+        self.assertGreater(guarded_size, direct_size)
+        self.assertTrue(target_page.get_xobjects())
+        target.close()
+        form_source.close()
 
     def test_repeated_running_headers_footers_and_page_numbers_are_removed(self) -> None:
         source = self.root / "running-margins.pdf"
@@ -751,6 +774,56 @@ class NativePdfToMarkdownTests(unittest.TestCase):
             [element.data for element in ordered],
             ["title", "left-first", "left-second", "right-first", "right-second"],
         )
+
+        landscape = fitz.Rect(0, 0, 792, 612)
+        triple_title = Element("text", fitz.Rect(150, 18, 675, 40), "triple-title")
+        triple_elements = [triple_title]
+        for column, x0 in enumerate((20, 278, 536)):
+            triple_elements.extend(
+                Element("text", fitz.Rect(x0, y, x0 + 230, y + 34), f"c{column + 1}-{row + 1}")
+                for row, y in enumerate((58, 118, 178))
+            )
+        ordered = sort_elements_reading_order(list(reversed(triple_elements)), landscape)
+        self.assertEqual(
+            [element.data for element in ordered],
+            [
+                "triple-title",
+                "c1-1", "c1-2", "c1-3",
+                "c2-1", "c2-2", "c2-3",
+                "c3-1", "c3-2", "c3-3",
+            ],
+        )
+
+        mixed = {
+            "bbox": (20, 20, 250, 100),
+            "lines": [
+                {"bbox": (20, 20, 200, 34), "spans": [{"text": "Section Band", "font": "Arial,Bold", "flags": 16, "color": 0xFFFFFF}]},
+                {"bbox": (20, 38, 200, 50), "spans": [{"text": "Run the command:", "font": "Arial", "flags": 0, "color": 0}]},
+                {"bbox": (30, 54, 220, 66), "spans": [{"text": "  visualizer -wave file.db", "font": "Courier", "flags": 8, "color": 0}]},
+                {"bbox": (20, 70, 200, 82), "spans": [{"text": "Then continue.", "font": "Arial", "flags": 0, "color": 0}]},
+            ],
+        }
+        split = split_structured_text_block(mixed)
+        self.assertEqual([len(part["lines"]) for part in split], [1, 1, 1, 1])
+
+        page = fitz.Rect(0, 0, 792, 612)
+        near_top_content = fitz.Rect(20, 27.7, 208, 40)
+        self.assertFalse(is_header_or_footer(near_top_content, page, 2, "Unique lane heading", set()))
+
+        command_lines = []
+        for row, (command, description) in enumerate(
+            (("-designfile <file>", "Loads a design"), ("[+radix]", "Loads radix"), ("[-do cmd]", "Runs commands"), ("[-l file]", "Writes a log"))
+        ):
+            y = 100 + row * 18
+            command_lines.extend(
+                [
+                    {"bbox": (545, y, 660, y + 10), "spans": [{"text": command, "font": "Arial"}]},
+                    {"bbox": (675, y, 770, y + 10), "spans": [{"text": description, "font": "Arial"}]},
+                ]
+            )
+        table = command_reference_table_markdown({"bbox": (545, 100, 772, 172), "lines": command_lines}, landscape)
+        self.assertIn("| -designfile <file> | Loads a design |", table or "")
+        self.assertEqual((table or "").count("\n|"), 5)
 
     def test_academic_math_indent_references_and_numbered_items(self) -> None:
         math_block = {

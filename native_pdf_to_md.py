@@ -240,11 +240,19 @@ def block_font_info(block: dict[str, Any]) -> tuple[float, bool, bool, bool, int
     for span in spans:
         flags |= int(span.get("flags", 0))
     colors = [int(s.get("color", 0)) for s in spans]
+    mono_characters = sum(
+        len(str(span.get("text", "")).strip())
+        for span in spans
+        if "courier" in str(span.get("font", "")).casefold()
+        or "mono" in str(span.get("font", "")).casefold()
+        or bool(int(span.get("flags", 0)) & 8)
+    )
+    visible_characters = sum(len(str(span.get("text", "")).strip()) for span in spans) or 1
     return (
         median_size,
         any(weight in font_names for weight in ("bold", "black", "semibold", "demi")) or bool(flags & 16),
         "italic" in font_names or "oblique" in font_names or bool(flags & 2),
-        "courier" in font_names or "mono" in font_names or bool(flags & 8),
+        mono_characters / visible_characters >= 0.60,
         max(set(colors), key=colors.count) if colors else None,
     )
 
@@ -295,7 +303,10 @@ def is_header_or_footer(
     # are used only for text proven to repeat across pages.
     if page_number == 1:
         return rect.y0 >= page_rect.height * 0.94
-    top_extreme = rect.y1 <= page_rect.height * 0.075
+    # Keep unique content that legitimately begins near the top edge, such as
+    # the first row of a landscape quick-reference sheet.  Repeated running
+    # heads still match the wider 12% candidate band below.
+    top_extreme = rect.y1 <= page_rect.height * 0.04
     bottom_extreme = rect.y0 >= page_rect.height * 0.89
     if top_extreme or bottom_extreme:
         return True
@@ -1135,6 +1146,177 @@ def split_leading_academic_heading(block: dict[str, Any]) -> list[dict[str, Any]
     return [make_block([lines[0]]), make_block(list(lines[1:]))]
 
 
+def line_is_mostly_monospaced(line: dict[str, Any]) -> bool:
+    spans = [span for span in line.get("spans", []) if str(span.get("text", "")).strip()]
+    if not spans:
+        return False
+    total = sum(len(str(span.get("text", "")).strip()) for span in spans)
+    mono = sum(
+        len(str(span.get("text", "")).strip())
+        for span in spans
+        if "courier" in str(span.get("font", "")).casefold()
+        or "mono" in str(span.get("font", "")).casefold()
+        or int(span.get("flags", 0)) & 8
+    )
+    return total > 0 and mono / total >= 0.60
+
+
+def line_is_white_banner_heading(line: dict[str, Any]) -> bool:
+    spans = [span for span in line.get("spans", []) if str(span.get("text", "")).strip()]
+    if not spans:
+        return False
+    bold = all(
+        any(weight in str(span.get("font", "")).casefold() for weight in ("bold", "black", "semibold", "demi"))
+        or bool(int(span.get("flags", 0)) & 16)
+        for span in spans
+    )
+    return bold and all(int(span.get("color", 0)) == 0xFFFFFF for span in spans)
+
+
+def split_structured_text_block(block: dict[str, Any]) -> list[dict[str, Any]]:
+    """Split banner headings and interleaved prose/code into ordered blocks."""
+
+    lines = list(block.get("lines", []))
+    if len(lines) < 2:
+        return [block]
+
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_kind: str | None = None
+    for index, line in enumerate(lines):
+        if index == 0 and line_is_white_banner_heading(line):
+            if current:
+                groups.append(current)
+                current = []
+            groups.append([line])
+            current_kind = None
+            continue
+
+        spans = [span for span in line.get("spans", []) if str(span.get("text", "")).strip()]
+        colored_heading = bool(spans) and all(
+            (
+                any(weight in str(span.get("font", "")).casefold() for weight in ("bold", "black", "semibold", "demi"))
+                or bool(int(span.get("flags", 0)) & 16)
+            )
+            and int(span.get("color", 0)) != 0
+            and float(span.get("size", 0)) >= 10.5
+            for span in spans
+        )
+        raw_text = "".join(str(span.get("text", "")) for span in line.get("spans", [])).lstrip()
+        starts_bullet = raw_text[:1] in BULLETS
+        if colored_heading:
+            kind = "heading"
+        elif line_is_mostly_monospaced(line):
+            kind = "code"
+        elif starts_bullet:
+            kind = "list"
+        elif current_kind == "list":
+            # An indented non-bullet line following a bullet belongs to that
+            # item until the next bullet or style transition.
+            kind = "list"
+        else:
+            kind = "text"
+
+        if current and (kind != current_kind or starts_bullet):
+            groups.append(current)
+            current = []
+        current.append(line)
+        current_kind = kind
+    if current:
+        groups.append(current)
+
+    if len(groups) == 1:
+        return [block]
+    return [block_from_lines(block, group) for group in groups if group]
+
+
+COMMAND_ENTRY_RE = re.compile(r"^(?:-{1,2}\w|\[{1,2}[+\-]|\+\w)")
+
+
+def command_reference_table_markdown(block: dict[str, Any], page_rect: fitz.Rect) -> str | None:
+    """Recover dense command/description pairs from an unruled two-lane block."""
+
+    lines = list(block.get("lines", []))
+    rect = fitz.Rect(block.get("bbox", (0, 0, 0, 0)))
+    if len(lines) < 8 or rect.width > page_rect.width * 0.42:
+        return None
+
+    starts = [float(line.get("bbox", rect)[0]) for line in lines]
+    if not starts:
+        return None
+    left_anchor = min(starts)
+    right_candidates = [value for value in starts if value - left_anchor >= rect.width * 0.32]
+    if len(right_candidates) < 3:
+        return None
+    right_anchor = sorted(right_candidates)[len(right_candidates) // 2]
+    divider = (left_anchor + right_anchor) / 2
+
+    ordered_lines = sorted(lines, key=lambda line: (float(line.get("bbox", rect)[1]), float(line.get("bbox", rect)[0])))
+    rows: list[dict[str, list[str]]] = []
+    for line in ordered_lines:
+        value = clean_text("".join(str(span.get("text", "")) for span in line.get("spans", [])))
+        if not value:
+            continue
+        x0 = float(line.get("bbox", rect)[0])
+        if x0 < divider:
+            if COMMAND_ENTRY_RE.match(value):
+                inline_description = ""
+                inline_match = re.match(r"^(.*?>\.\.\.)\s+([A-Z].+)$", value)
+                if inline_match:
+                    value, inline_description = inline_match.groups()
+                rows.append({"command": [value], "description": [inline_description] if inline_description else []})
+            elif rows:
+                target = "description" if rows[-1]["description"] else "command"
+                rows[-1][target].append(value)
+        elif rows:
+            rows[-1]["description"].append(value)
+
+    useful = [row for row in rows if row["description"]]
+    if len(useful) < 4:
+        return None
+    rendered = ["| Command | Description |", "| --- | --- |"]
+    for row in useful:
+        command = markdown_escape(" ".join(row["command"]))
+        description = markdown_escape(" ".join(row["description"]))
+        rendered.append(f"| {command} | {description} |")
+    return "\n".join(rendered)
+
+
+def merge_command_reference_blocks(
+    blocks: Sequence[dict[str, Any]], page_rect: fitz.Rect
+) -> list[dict[str, Any]]:
+    """Join a command table continuation split into adjacent PDF blocks."""
+
+    merged = list(blocks)
+    removed: set[int] = set()
+    for index, previous in enumerate(merged):
+        if index in removed:
+            continue
+        previous_starts = sum(bool(COMMAND_ENTRY_RE.match(value)) for value in plain_lines(previous))
+        if previous_starts < 4:
+            continue
+        previous_rect = fitz.Rect(previous["bbox"])
+        for candidate_index, block in enumerate(merged):
+            if candidate_index == index or candidate_index in removed:
+                continue
+            current_rect = fitz.Rect(block["bbox"])
+            current_starts = sum(bool(COMMAND_ENTRY_RE.match(value)) for value in plain_lines(block))
+            same_lane = (
+                abs(previous_rect.x0 - current_rect.x0) <= 4
+                and max(previous_rect.x1, current_rect.x1) - min(previous_rect.x0, current_rect.x0)
+                <= page_rect.width * 0.42
+            )
+            adjacent = -3 <= current_rect.y0 - previous_rect.y1 <= 16
+            if current_starts >= 1 and same_lane and adjacent:
+                combined = dict(previous)
+                combined["lines"] = list(previous.get("lines", [])) + list(block.get("lines", []))
+                previous_rect |= current_rect
+                combined["bbox"] = tuple(previous_rect)
+                merged[index] = previous = combined
+                removed.add(candidate_index)
+    return [block for index, block in enumerate(merged) if index not in removed]
+
+
 def is_horizontal_text_block(block: dict[str, Any]) -> bool:
     lines = block.get("lines", [])
     if not lines:
@@ -1174,10 +1356,50 @@ def has_two_columns(elements: Sequence[Element], page_rect: fitz.Rect) -> bool:
     return right_boundary - left_boundary >= page_rect.width * 0.008
 
 
+def has_three_columns(elements: Sequence[Element], page_rect: fitz.Rect) -> bool:
+    """Detect three independent text lanes on landscape quick-reference pages.
+
+    Three-column cheat sheets place ordinary blocks wholly inside the left,
+    middle, and right thirds.  Testing those inner lane bounds avoids treating
+    the two ordinary columns of a paper as three merely because it has a few
+    short centered headings or captions.
+    """
+
+    width = page_rect.width
+    left_limit = page_rect.x0 + width * 0.40
+    middle_left = page_rect.x0 + width * 0.27
+    middle_right = page_rect.x0 + width * 0.73
+    right_limit = page_rect.x0 + width * 0.60
+    lanes: list[list[fitz.Rect]] = [[], [], []]
+
+    for element in elements:
+        rect = element.bbox
+        if rect.height < 3 or rect.width > width * 0.42:
+            continue
+        center = (rect.x0 + rect.x1) / 2
+        if rect.x1 <= left_limit and center < page_rect.x0 + width / 3:
+            lanes[0].append(rect)
+        elif rect.x0 >= middle_left and rect.x1 <= middle_right:
+            lanes[1].append(rect)
+        elif rect.x0 >= right_limit and center > page_rect.x0 + width * 2 / 3:
+            lanes[2].append(rect)
+
+    if any(not lane for lane in lanes):
+        return False
+
+    # Require sustained content in every lane.  This rejects isolated labels
+    # while accepting a lane emitted by PyMuPDF as one tall text block.
+    return all(
+        len(lane) >= 3 or sum(rect.height for rect in lane) >= page_rect.height * 0.18
+        for lane in lanes
+    )
+
+
 def sort_elements_reading_order(elements: Sequence[Element], page_rect: fitz.Rect) -> list[Element]:
-    """Sort single-column pages normally and double-column pages by reading flow."""
+    """Sort single-, double-, and triple-column pages by reading flow."""
     normal = sorted(elements, key=lambda item: (round(item.bbox.y0, 1), round(item.bbox.x0, 1), item.kind, item.order))
-    if not has_two_columns(normal, page_rect):
+    column_count = 3 if has_three_columns(normal, page_rect) else 2 if has_two_columns(normal, page_rect) else 1
+    if column_count == 1:
         return normal
 
     mid = page_rect.x0 + page_rect.width / 2
@@ -1185,7 +1407,11 @@ def sort_elements_reading_order(elements: Sequence[Element], page_rect: fitz.Rec
     column_items: list[Element] = []
     for element in normal:
         rect = element.bbox
-        crosses_gutter = rect.x0 < mid - page_rect.width * 0.025 and rect.x1 > mid + page_rect.width * 0.025
+        crosses_gutter = (
+            column_count == 2
+            and rect.x0 < mid - page_rect.width * 0.025
+            and rect.x1 > mid + page_rect.width * 0.025
+        )
         if rect.width >= page_rect.width * 0.62 or crosses_gutter:
             spanning.append(element)
         else:
@@ -1196,10 +1422,15 @@ def sort_elements_reading_order(elements: Sequence[Element], page_rect: fitz.Rec
 
     def emit_band(limit_y: float) -> None:
         selected = [index for index in remaining if column_items[index].bbox.y0 < limit_y]
-        left = [column_items[index] for index in selected if column_items[index].bbox.x0 + column_items[index].bbox.x1 < 2 * mid]
-        right = [column_items[index] for index in selected if column_items[index].bbox.x0 + column_items[index].bbox.x1 >= 2 * mid]
-        ordered.extend(sorted(left, key=lambda item: (item.bbox.y0, item.bbox.x0, item.order)))
-        ordered.extend(sorted(right, key=lambda item: (item.bbox.y0, item.bbox.x0, item.order)))
+        columns: list[list[Element]] = [[] for _ in range(column_count)]
+        for index in selected:
+            item = column_items[index]
+            center = (item.bbox.x0 + item.bbox.x1) / 2
+            relative = (center - page_rect.x0) / max(page_rect.width, 1.0)
+            column = min(column_count - 1, max(0, int(relative * column_count)))
+            columns[column].append(item)
+        for column in columns:
+            ordered.extend(sorted(column, key=lambda item: (item.bbox.y0, item.bbox.x0, item.order)))
         remaining.difference_update(selected)
 
     for element in sorted(spanning, key=lambda item: (item.bbox.y0, item.bbox.x0, item.order)):
@@ -1210,18 +1441,27 @@ def sort_elements_reading_order(elements: Sequence[Element], page_rect: fitz.Rec
 
 
 def page_drawing_content_stream_bytes(page: fitz.Page) -> int:
-    """Return compressed page-content bytes used as a cheap path-complexity guard."""
+    """Return compressed page and nested Form streams for a cheap complexity guard."""
     document = page.parent
     if document is None:
         return 0
-    total = 0
+    content_xrefs: set[int] = set()
     try:
-        content_xrefs = page.get_contents()
+        content_xrefs.update(int(xref) for xref in page.get_contents())
     except (AttributeError, RuntimeError, ValueError):
-        return 0
+        pass
+    # Plot-heavy PDFs often keep the real drawing program in nested Form
+    # XObjects while the page stream contains only a tiny ``Do`` command.
+    # get_xobjects() lists those references without expanding hundreds of
+    # thousands of paths, so include their compressed streams in the guard.
+    try:
+        content_xrefs.update(int(item[0]) for item in page.get_xobjects() if item)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+    total = 0
     for xref in content_xrefs:
         try:
-            payload = document.xref_stream_raw(int(xref))
+            payload = document.xref_stream_raw(xref)
         except (RuntimeError, TypeError, ValueError):
             continue
         if payload:
@@ -1240,7 +1480,9 @@ def page_elements(
     for block in raw.get("blocks", []):
         if block.get("type") != 0 or not block.get("lines") or not is_horizontal_text_block(block):
             continue
-        text_blocks.extend(split_leading_academic_heading(block))
+        for academic_part in split_leading_academic_heading(block):
+            text_blocks.extend(split_structured_text_block(academic_part))
+    text_blocks = merge_command_reference_blocks(text_blocks, page.rect)
     images = image_elements(doc, page, image_dir, text_blocks)
     raster_rects = [element.bbox for element in images]
     drawing_stream_bytes = page_drawing_content_stream_bytes(page)
@@ -1449,6 +1691,14 @@ def render_page(
         if not formatted:
             continue
         report.text_characters += len(text)
+
+        command_table = command_reference_table_markdown(block, page.rect)
+        if command_table:
+            flush_list()
+            output.append(command_table)
+            report.tables += 1
+            pending_callout = False
+            continue
 
         mini_toc = dot_leader_block_markdown(block)
         if mini_toc:
