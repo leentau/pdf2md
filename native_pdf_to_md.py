@@ -1539,8 +1539,25 @@ def render_page(
     suppress_heading_fallback: bool = False,
     metadata_title: str = "",
     repeated_margin_texts: set[str] | None = None,
+    figure_regions: Sequence[fitz.Rect] | None = None,
 ) -> list[str]:
     elements, _ = page_elements(doc, page, image_dir, repeated_margin_texts)
+    if figure_regions:
+        retained = []
+        for element in elements:
+            if element.kind == 'text':
+                lines = [line for line in element.data['lines']
+                         if not inside_any(fitz.Rect(line['bbox']), figure_regions, threshold=.75)]
+                if lines:
+                    block = block_from_lines(element.data, lines)
+                    retained.append(Element('text', fitz.Rect(block['bbox']), block, element.order))
+            elif not inside_any(element.bbox, figure_regions, threshold=.5):
+                retained.append(element)
+        for index, rect in enumerate(figure_regions, 1):
+            path = image_dir / f'page-{page.number+1:03d}-enhanced-{index:02d}.png'
+            page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), clip=rect, alpha=False).save(path)
+            retained.append(Element('image', rect, {'path':path, 'caption':''}, 2000+index))
+        elements = sort_elements_reading_order(retained, page.rect)
     two_column_layout = has_two_columns(elements, page.rect)
     output: list[str] = [f"<!-- PDF page {page.number + 1} -->"]
     pending_callout = False
@@ -2250,6 +2267,7 @@ def convert_pdf(
     route: str = "auto",
     max_api_file_mb: float = 190.0,
     max_pages_per_chunk: int = 180,
+    figure_mode: str = 'local',
 ) -> DocumentReport:
     source = source.expanduser().resolve()
     if not source.is_file() or source.suffix.casefold() != ".pdf":
@@ -2257,6 +2275,10 @@ def convert_pdf(
 
     if route not in {"auto", "native", "mineru-ocr"}:
         raise ConversionError(f"未知处理路由：{route}")
+    if figure_mode not in {'local', 'mineru'}:
+        raise ConversionError('未知图片处理模式')
+    if route == 'native' and figure_mode == 'mineru':
+        raise ConversionError('--route native 禁止上传，不能同时启用 MinerU 图片增强')
 
     native_rejection: str | None = None
     if route != "mineru-ocr":
@@ -2308,6 +2330,15 @@ def convert_pdf(
     try:
         with fitz.open(source) as doc:
             text_count = validate_text_layer(doc)
+            enhanced_regions = {}
+            if figure_mode == 'mineru':
+                from figure_enrichment import discover_regions
+                try:
+                    enhanced_regions = discover_regions(source, doc, destination.parent / '.figure_cache',
+                                                        mineru_token, mineru_model, mineru_language)
+                except Exception as exc:
+                    raise ConversionError('MinerU 图片增强失败；已保留缓存，未生成新的完成输出。'
+                                          f'错误类型：{type(exc).__name__}；请检查网络、Token及缓存结果。') from None
             bookmarks, bookmarks_by_page = make_bookmarks(doc)
             suppress_fallback_pages = heading_fallback_suppressed_pages(bookmarks, doc.page_count)
             report = DocumentReport(
@@ -2317,6 +2348,8 @@ def convert_pdf(
                 text_characters=text_count,
                 bookmarks_total=len(bookmarks),
             )
+            if enhanced_regions:
+                report.conversion_engine = 'native+mineru-figures'
             matched: set[tuple[int, str]] = set()
             markdown: list[str] = []
             metadata_title = clean_text(doc.metadata.get("title", "") if doc.metadata else "")
@@ -2337,6 +2370,7 @@ def convert_pdf(
                         suppress_heading_fallback=(page.number + 1 in suppress_fallback_pages),
                         metadata_title=metadata_title,
                         repeated_margin_texts=repeated_margin_texts,
+                        figure_regions=enhanced_regions.get(page.number+1),
                     )
                 )
 
@@ -2348,6 +2382,12 @@ def convert_pdf(
             ]
 
         markdown_text = join_markdown_parts(markdown)
+        # Figure enrichment can replace images already extracted locally.
+        # Only clean this conversion's fresh staging directory, never old output.
+        referenced_images = set(re.findall(r'\]\(images/([^\)]+)\)', markdown_text))
+        for generated_image in image_dir.iterdir():
+            if generated_image.is_file() and generated_image.name not in referenced_images:
+                generated_image.unlink()
         markdown_path = final_temp / f"{folder_name}.md"
         markdown_path.write_text(markdown_text, encoding="utf-8", newline="\n")
         atomic_replace_dir(final_temp, destination, overwrite=overwrite)
@@ -2362,7 +2402,7 @@ def convert_pdf(
             )
         shutil.rmtree(temp_dir, ignore_errors=True)
         return report
-    except Exception:
+    except BaseException:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise
 
@@ -2481,6 +2521,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="禁用 MinerU 自动 OCR；非原生文字 PDF 将直接报错",
     )
+    parser.add_argument('--figure-mode', choices=('local', 'mineru'), default='local',
+                        help='图片处理：local 本地；mineru 上传候选图片页辅助定位，正文标题仍本地解析')
     parser.add_argument("--verbose", action="store_true", help="显示逐页进度")
     return parser
 
@@ -2518,6 +2560,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         print("错误：--disable-mineru-ocr 与 --route mineru-ocr 不能同时使用。", file=sys.stderr)
         return 2
     effective_route = "native" if args.disable_mineru_ocr and args.route == "auto" else args.route
+    if effective_route == 'native' and args.figure_mode == 'mineru':
+        print('错误：禁止上传模式不能同时启用 --figure-mode mineru。', file=sys.stderr)
+        return 2
     mineru_token = None
     if effective_route != "native" and any(item.suffix.casefold() == ".pdf" for item in documents):
         mineru_token = find_mineru_token(args.mineru_token_file, input_path)
@@ -2553,6 +2598,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                     route=effective_route,
                     max_api_file_mb=args.max_api_file_mb,
                     max_pages_per_chunk=args.max_pages_per_chunk,
+                    figure_mode=args.figure_mode,
                 )
             else:
                 report = convert_word_document(

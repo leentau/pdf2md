@@ -16,6 +16,8 @@ mineru_token.txt
 
 # Runtime output and caches
 .mineru_cache/
+.figure_cache/
+_figure_test_*/
 _reports/
 *.log
 
