@@ -5,7 +5,7 @@
 无需额外参数，原生 PDF 默认启用混合处理：本地解析正文、书签标题、代码和表格，MinerU 仅提供候选图片页的图片区域坐标，再从原 PDF 渲染图片。示例：
 
 ```powershell
-.\pdf2md.bat "D:\Tessent_manual\doc2026.3\in_system_test.pdf" --overwrite
+.\pdf2md.bat "D:\documents\manual.pdf" --overwrite
 ```
 
 单个 PDF 和目录递归转换均默认启用图片增强；已有结果仍默认跳过，需要 `--overwrite` 才会重新转换。`--figure-mode local` 关闭图片增强，但不禁止扫描件的整本 OCR 上传。要完全禁止上传，使用 `--route native` 或 `--disable-mineru-ocr`：程序自动采用本地图片处理；若同时显式指定 `--figure-mode mineru` 则报参数冲突。扫描件及触发复杂矢量回退的 PDF 仍按整份文档走 MinerU，可能分片上传。
@@ -149,12 +149,12 @@ MINERU_TOKEN=你的_MinerU_Token
 也可以强制指定路线，便于对同一份大文件分别验证两种处理方式：
 
 ```powershell
-# 把 ptug.pdf 当作纯原生文字 PDF：本地逐页处理，不上传
-.\pdf2md.bat .\paper\goo\ptug.pdf `
+# 把 manual.pdf 当作纯原生文字 PDF：本地逐页处理，不上传
+.\pdf2md.bat .\documents\manual.pdf `
   --route native --report --overwrite
 
-# 把同一个 ptug.pdf 当作扫描图片 PDF：强制 MinerU OCR、自动分片、断点续传和合并
-.\pdf2md.bat .\paper\goo\ptug.pdf `
+# 把同一个 manual.pdf 当作扫描图片 PDF：强制 MinerU OCR、自动分片、断点续传和合并
+.\pdf2md.bat .\documents\manual.pdf `
   --route mineru-ocr --report --overwrite
 ```
 
@@ -173,25 +173,25 @@ MinerU OCR 会把需要识别的 PDF 上传到 MinerU 服务。敏感文档使�
 ## 转换单个 PDF
 
 ```powershell
-.\pdf2md.bat .\a\tshell_lbist_user.pdf
+.\pdf2md.bat .\a\manual.pdf
 ```
 
-输出固定为 PDF 同目录的 `a/tshell_lbist_user/tshell_lbist_user.md`，图片位于 `a/tshell_lbist_user/images/`。
+输出固定为 PDF 同目录的 `a/manual/manual.md`，图片位于 `a/manual/images/`。
 
 覆盖已有结果并输出结构核验报告（报告写入输出根目录的 `_reports`，不会改变单个 PDF 文件夹结构）：
 
 ```powershell
-.\pdf2md.bat .\a\tshell_lbist_user.pdf --overwrite --report
+.\pdf2md.bat .\a\manual.pdf --overwrite --report
 ```
 
 ## 转换 Word 文档
 
 ```powershell
-.\pdf2md.bat .\tshell_ijtag_user.docx `
+.\pdf2md.bat .\document.docx `
   --overwrite --report
 ```
 
-单文件输出为 `tshell_ijtag_user/tshell_ijtag_user.md` 和 `tshell_ijtag_user/images/`。当前支持 `.docx`；`--route` 和 MinerU 参数只作用于 PDF。
+单文件输出为 `document/document.md` 和 `document/images/`。当前支持 `.docx`；`--route` 和 MinerU 参数只作用于 PDF。
 
 ## 批量转换
 

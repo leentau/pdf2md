@@ -1244,7 +1244,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="递归调用 MinerU 将 PDF 转为 Markdown，并保留图片集。",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("input_dir", type=Path, help="输入 PDF 文件夹，例如 E:\\Tessent\\9.Gemini\\paper")
+    parser.add_argument("input_dir", type=Path, help="输入 PDF 文件夹，例如 D:\\documents")
     parser.add_argument("--output-dir", type=Path, help="输出根目录；不指定时使用 <输入目录>_mineru_md")
     parser.add_argument("--token", help="MinerU Token；更推荐使用 MINERU_TOKEN 环境变量")
     parser.add_argument(
