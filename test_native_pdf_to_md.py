@@ -321,7 +321,7 @@ class NativePdfToMarkdownTests(unittest.TestCase):
     def test_heading_levels_images_and_folder_contract(self) -> None:
         source = self.make_structured_pdf()
         output_root = self.root / "output"
-        report = convert_pdf(source, output_root, write_report=True)
+        report = convert_pdf(source, output_root, write_report=True, figure_mode='local')
         folder = output_root / "manual"
         markdown = (folder / "manual.md").read_text(encoding="utf-8")
 

@@ -2255,6 +2255,17 @@ def atomic_replace_dir(source: Path, destination: Path, overwrite: bool) -> None
     source.replace(destination)
 
 
+def resolve_figure_mode(route: str, figure_mode: str | None) -> str:
+    """Default to enhancement, while preserving explicit no-upload routes."""
+    if figure_mode is None:
+        return 'local' if route == 'native' else 'mineru'
+    if figure_mode not in {'local', 'mineru'}:
+        raise ConversionError('未知图片处理模式')
+    if route == 'native' and figure_mode == 'mineru':
+        raise ConversionError('--route native 禁止上传，不能同时启用 MinerU 图片增强')
+    return figure_mode
+
+
 def convert_pdf(
     source: Path,
     output_root: Path,
@@ -2267,7 +2278,7 @@ def convert_pdf(
     route: str = "auto",
     max_api_file_mb: float = 190.0,
     max_pages_per_chunk: int = 180,
-    figure_mode: str = 'local',
+    figure_mode: str | None = None,
 ) -> DocumentReport:
     source = source.expanduser().resolve()
     if not source.is_file() or source.suffix.casefold() != ".pdf":
@@ -2275,10 +2286,7 @@ def convert_pdf(
 
     if route not in {"auto", "native", "mineru-ocr"}:
         raise ConversionError(f"未知处理路由：{route}")
-    if figure_mode not in {'local', 'mineru'}:
-        raise ConversionError('未知图片处理模式')
-    if route == 'native' and figure_mode == 'mineru':
-        raise ConversionError('--route native 禁止上传，不能同时启用 MinerU 图片增强')
+    figure_mode = resolve_figure_mode(route, figure_mode)
 
     native_rejection: str | None = None
     if route != "mineru-ocr":
@@ -2521,8 +2529,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="禁用 MinerU 自动 OCR；非原生文字 PDF 将直接报错",
     )
-    parser.add_argument('--figure-mode', choices=('local', 'mineru'), default='local',
-                        help='图片处理：local 本地；mineru 上传候选图片页辅助定位，正文标题仍本地解析')
+    parser.add_argument('--figure-mode', choices=('local', 'mineru'), default=None,
+                        help='默认 mineru：上传候选图片页辅助定位，正文标题仍本地解析；local 关闭增强。禁止上传模式默认 local')
     parser.add_argument("--verbose", action="store_true", help="显示逐页进度")
     return parser
 
@@ -2560,8 +2568,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         print("错误：--disable-mineru-ocr 与 --route mineru-ocr 不能同时使用。", file=sys.stderr)
         return 2
     effective_route = "native" if args.disable_mineru_ocr and args.route == "auto" else args.route
-    if effective_route == 'native' and args.figure_mode == 'mineru':
-        print('错误：禁止上传模式不能同时启用 --figure-mode mineru。', file=sys.stderr)
+    try:
+        args.figure_mode = resolve_figure_mode(effective_route, args.figure_mode)
+    except ConversionError as exc:
+        print(f'错误：{exc}', file=sys.stderr)
         return 2
     mineru_token = None
     if effective_route != "native" and any(item.suffix.casefold() == ".pdf" for item in documents):

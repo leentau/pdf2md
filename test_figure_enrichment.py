@@ -18,6 +18,29 @@ def workspace_temp():
 
 
 class FigureTests(unittest.TestCase):
+    def test_default_enhancement_and_no_upload_precedence(self):
+        args = n.build_parser().parse_args(['sample.pdf'])
+        self.assertEqual(n.resolve_figure_mode(args.route, args.figure_mode), 'mineru')
+        self.assertEqual(n.resolve_figure_mode('native', args.figure_mode), 'local')
+        self.assertEqual(n.resolve_figure_mode('auto', 'local'), 'local')
+        with self.assertRaises(n.ConversionError):
+            n.resolve_figure_mode('native', 'mineru')
+
+    def test_default_conversion_calls_enhancement_and_preserves_output_on_failure(self):
+        with workspace_temp() as directory, f.open() as doc:
+            path = directory / 'sample.pdf'
+            doc.new_page().insert_text((50, 50), 'Figure 1-1: Example diagram')
+            doc.save(path)
+            destination = directory / 'sample'
+            destination.mkdir()
+            previous = destination / 'sample.md'
+            previous.write_text('previous output')
+            with patch.object(n, 'validate_text_layer', return_value=1000), patch('figure_enrichment.discover_regions', side_effect=ValueError('missing token')) as discover:
+                with self.assertRaises(n.ConversionError):
+                    n.convert_pdf(path, directory, overwrite=True)
+                discover.assert_called_once()
+            self.assertEqual(previous.read_text(), 'previous output')
+
     def test_split_charts_restore_full_bitmap(self):
         class Page:
             rect=f.Rect(0,0,612,792)

@@ -1,14 +1,14 @@
 # PDF / DOCX 转结构化 Markdown
 
-## 可选的 MinerU 图片增强
+## 默认启用 MinerU 图片增强
 
-使用 `--figure-mode mineru` 为原生 PDF 启用混合处理：本地解析正文、书签标题、代码和表格，MinerU 仅提供候选图片页的图片区域坐标，再从原 PDF 渲染图片。示例：
+无需额外参数，原生 PDF 默认启用混合处理：本地解析正文、书签标题、代码和表格，MinerU 仅提供候选图片页的图片区域坐标，再从原 PDF 渲染图片。示例：
 
 ```powershell
-.\pdf2md.bat "D:\Tessent_manual\doc2026.3\in_system_test.pdf" --figure-mode mineru --overwrite
+.\pdf2md.bat "D:\Tessent_manual\doc2026.3\in_system_test.pdf" --overwrite
 ```
 
-目录输入也支持这个参数；已有结果需要 `--overwrite` 才会重新转换。默认 `--figure-mode local` 保持原来的本地图片流程。`--route native` 或 `--disable-mineru-ocr` 禁止上传，不能与图片增强同时使用。扫描件仍按原有整本 MinerU 流程转换。
+单个 PDF 和目录递归转换均默认启用图片增强；已有结果仍默认跳过，需要 `--overwrite` 才会重新转换。`--figure-mode local` 关闭图片增强，但不禁止扫描件的整本 OCR 上传。要完全禁止上传，使用 `--route native` 或 `--disable-mineru-ocr`：程序自动采用本地图片处理；若同时显式指定 `--figure-mode mineru` 则报参数冲突。扫描件及触发复杂矢量回退的 PDF 仍按整份文档走 MinerU，可能分片上传。
 
 图片增强会将候选页的完整内容上传至 MinerU，需要配置 Token。按单页提交，成功结果缓存于输出根目录 `.figure_cache`，源文件内容、模型或语言变化会使用新缓存。失败会报错并保留缓存，不发布新的完成输出；识别结果没有图片时明确提示核查。缓存可能包含源页面和识别结果，应按原文档保管。
 
@@ -18,7 +18,7 @@
 
 验证范围：一份 470 页手册的 96 个编号图已完成对应核查：95 个图形保留为图片，1 个代码示例保留原生代码及跨页续段；最终 98 个图片引用包含两张未编号代码/日志截图，225 个书签标题全部匹配，34 项回归测试通过。封面装饰不计入验收；原始位图清晰度、原图淡色无法凭渲染提高。这是该样本文档的验收结论，不保证任意 PDF 的图形、正文和表格均无错误。
 
-这个自包含 Python 工具把 PDF 和 Word DOCX 转成结构化 Markdown，提取图片、表格、代码、标题和列表。原生 PDF 在本地解析；扫描件或缺少可用文字层的 PDF 可以自动转到 MinerU OCR。
+这个自包含 Python 工具把 PDF 和 Word DOCX 转成结构化 Markdown，提取图片、表格、代码、标题和列表。原生 PDF 的正文在本地解析，候选图片页默认上传 MinerU 辅助定位；扫描件或缺少可用文字层的 PDF 可以自动转到 MinerU OCR。
 
 ## 快速开始
 
@@ -138,7 +138,7 @@ MINERU_TOKEN=你的_MinerU_Token
 自动分流规则：
 
 1. `--route auto` 是默认值，单文件和目录批处理都不必额外指定。目录模式会对每个 PDF 分别判断。
-2. 正文分流颗粒度固定为整份 PDF，使用本地原生解析或 MinerU OCR。可选的 `--figure-mode mineru` 只增强原生解析中的图片区域，不使用 MinerU 生成的正文或标题。
+2. 正文分流颗粒度固定为整份 PDF，使用本地原生解析或 MinerU OCR。默认启用的 MinerU 图片处理只增强原生解析中的图片区域，不使用 MinerU 生成的正文或标题。
 3. PDF 具有足够的可见原生文字、没有检测到整页扫描页，并且没有超复杂矢量页面时，整份 PDF 使用本地原生元素解析。
 4. 任意页面检测为整页扫描图、只有 `ignore-text` 隐藏文字层，或整份 PDF 的原生可见文字总量不足时，整份 PDF 使用 MinerU OCR。
 5. 任意页面自身及其嵌套 Form XObject 的压缩绘图内容合计超过 2 MiB 时，为避免本地展开数十万个矢量路径而卡住，整份 PDF 自动使用 MinerU OCR。
