@@ -57,10 +57,13 @@ class FigureTests(unittest.TestCase):
             destination.mkdir()
             previous = destination / 'sample.md'
             previous.write_text('previous output')
-            with patch.object(n, 'validate_text_layer', return_value=1000), patch('figure_enrichment.discover_regions', side_effect=ValueError('missing token')) as discover:
-                with self.assertRaises(n.ConversionError):
-                    n.convert_pdf(path, directory, overwrite=True)
+            with patch.object(n, 'validate_text_layer', return_value=1000), patch('figure_enrichment.discover_regions', side_effect=ValueError('HTTP 401 expired test-secret https://example.com/?signature=private')) as discover:
+                with self.assertRaises(n.ConversionError) as caught:
+                    n.convert_pdf(path, directory, overwrite=True, mineru_token='test-secret')
                 discover.assert_called_once()
+            self.assertIn('HTTP 401', str(caught.exception))
+            self.assertNotIn('test-secret', str(caught.exception))
+            self.assertNotIn('signature=private', str(caught.exception))
             self.assertEqual(previous.read_text(), 'previous output')
 
     def test_split_charts_restore_full_bitmap(self):

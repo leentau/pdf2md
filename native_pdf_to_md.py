@@ -2345,8 +2345,15 @@ def convert_pdf(
                     enhanced_regions = discover_regions(source, doc, destination.parent / '.figure_cache',
                                                         mineru_token, mineru_model, mineru_language)
                 except Exception as exc:
+                    from mineru_pdf_to_md import redact
+                    detail = redact(exc, mineru_token)
+                    # Signed download URLs and JWTs must not appear in logs.
+                    detail = re.sub(r'https?://\S+', '[URL 已隐藏]', detail)
+                    detail = re.sub(r'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+',
+                                    '[Token 已隐藏]', detail)
                     raise ConversionError('MinerU 图片增强失败；已保留缓存，未生成新的完成输出。'
-                                          f'错误类型：{type(exc).__name__}；请检查网络、Token及缓存结果。') from None
+                                          f'错误类型：{type(exc).__name__}；原因：{detail}。'
+                                          '若为 Token 失效或 HTTP 401，请更新本地 Token 后重试。') from None
             bookmarks, bookmarks_by_page = make_bookmarks(doc)
             suppress_fallback_pages = heading_fallback_suppressed_pages(bookmarks, doc.page_count)
             report = DocumentReport(
