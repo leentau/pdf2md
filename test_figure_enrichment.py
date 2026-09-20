@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 import pymupdf as f
 import native_pdf_to_md as n
-from figure_enrichment import image_regions, candidate_page, discover_regions
+from figure_enrichment import image_regions, candidate_page, discover_regions, write_upload_page
 
 @contextmanager
 def workspace_temp():
@@ -18,6 +18,28 @@ def workspace_temp():
 
 
 class FigureTests(unittest.TestCase):
+    def test_upload_page_removes_unused_resources_and_other_pages(self):
+        with workspace_temp() as directory, f.open() as doc:
+            page = doc.new_page()
+            pix = f.Pixmap(f.csRGB, f.IRect(0, 0, 32, 32), False)
+            pix.clear_with(80)
+            page.insert_image(f.Rect(10, 10, 90, 90), stream=pix.tobytes('png'))
+            kept_content = page.get_contents()[0]
+            pix.clear_with(160)
+            page.insert_image(f.Rect(100, 10, 180, 90), stream=pix.tobytes('png'))
+            page.set_contents(kept_content)
+            self.assertEqual(len(page.get_images()), 2)
+            before = page.get_pixmap().samples
+            doc.new_page().insert_text((40, 40), 'OTHER PAGE MUST NOT BE UPLOADED')
+            output = directory / 'page.pdf'
+            output.write_bytes(b'old cached sample')
+            write_upload_page(doc, 0, output)
+            with f.open(output) as result:
+                self.assertEqual(len(result), 1)
+                self.assertEqual(len(result[0].get_images()), 1)
+                self.assertEqual(result[0].get_pixmap().samples, before)
+                self.assertNotIn('OTHER PAGE', result[0].get_text())
+
     def test_default_enhancement_and_no_upload_precedence(self):
         args = n.build_parser().parse_args(['sample.pdf'])
         self.assertEqual(n.resolve_figure_mode(args.route, args.figure_mode), 'mineru')

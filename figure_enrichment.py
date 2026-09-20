@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import re
+import uuid
 import pymupdf as fitz
 from mineru_pdf_to_md import MineruApi, safe_extract_zip
 
@@ -160,6 +161,23 @@ def refine_regions(regions, blocks, page, sx=1, sy=1):
     return sorted(merged, key=lambda r:(r.y0,r.x0))
 
 
+def write_upload_page(doc, page_number, target):
+    """Copy one page, pruning shared resources not used by its content."""
+    temporary = target.with_name(target.name + '.' + uuid.uuid4().hex + '.tmp')
+    try:
+        with fitz.open() as selected:
+            selected.insert_pdf(doc, from_page=page_number, to_page=page_number)
+            selected[0].clean_contents(sanitize=True)
+            selected.set_metadata({})
+            selected.save(temporary, garbage=4, deflate=True)
+        with fitz.open(temporary) as check:
+            if len(check) != 1:
+                raise ValueError('拒绝上传：提取文件必须恰好包含一页')
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def discover_regions(source, doc, cache_root, token, model='vlm', language='en'):
     """One-page tasks bound upload size and retain completed tasks across retries."""
     digest = hashlib.sha256()
@@ -185,14 +203,14 @@ def discover_regions(source, doc, cache_root, token, model='vlm', language='en')
             if api is None:
                 api = MineruApi(token, model_version=model, language=language, is_ocr=True)
             sample = folder / 'page.pdf'
-            if not sample.exists():
-                with fitz.open() as selected:
-                    selected.insert_pdf(doc, from_page=page.number, to_page=page.number)
-                    selected.save(sample)
+            # Rebuild even an old cached sample, which may retain unused
+            # document-wide image resources. Completed API tasks still resume.
+            write_upload_page(doc, page.number, sample)
             if sample.stat().st_size >= 190*1024*1024:
                 raise ValueError(f'第 {number} 页超过图片增强单页上传限制 190 MiB')
             state = folder / 'task.json'
-            LOGGER.warning('图片增强：第 %d/%d 页，上传/查询 MinerU', number, len(doc))
+            LOGGER.warning('图片增强：原文第 %d/%d 页；提取文件仅 1 页，清理后 %.2f MiB，上传/查询 MinerU',
+                           number, len(doc), sample.stat().st_size / (1024*1024))
             if state.exists():
                 batch = json.loads(state.read_text(encoding='utf-8'))['batch_id']
             else:
